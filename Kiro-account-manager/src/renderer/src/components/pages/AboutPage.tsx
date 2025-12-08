@@ -179,7 +179,7 @@ export function AboutPage() {
               <p className="font-medium">chaogei666</p>
             </div>
             <a 
-              href="https://github.com/chaogei" 
+              href="https://github.com/chaogei/Kiro-account-manager" 
               target="_blank" 
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted"

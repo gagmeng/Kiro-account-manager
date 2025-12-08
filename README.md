@@ -1,7 +1,7 @@
 # Kiro 账户管理器
 
 <p align="center">
-  <img src="resources/icon.png" width="128" height="128" alt="Kiro Logo">
+  <img src="Kiro-account-manager/resources/icon.png" width="128" height="128" alt="Kiro Logo">
 </p>
 
 <p align="center">
@@ -58,27 +58,27 @@
 ### 主页
 显示账号统计、当前使用账号详情、订阅信息和额度明细。
 
-![主页](resources/主页.png)
+![主页](Kiro-account-manager/resources/主页.png)
 
 ### 账户管理
 管理所有账号，支持搜索、筛选、批量操作，一键切换账号。
 
-![账户管理](resources/账户管理.png)
+![账户管理](Kiro-account-manager/resources/账户管理.png)
 
 ### 机器码管理
 管理设备标识符，防止账号关联封禁，支持备份恢复。
 
-![机器码管理](resources/机器码管理.png)
+![机器码管理](Kiro-account-manager/resources/机器码管理.png)
 
 ### 设置
 配置主题颜色、隐私模式、自动刷新、代理等选项。
 
-![设置](resources/设置.png)
+![设置](Kiro-account-manager/resources/设置.png)
 
 ### 关于
 查看版本信息、功能列表、技术栈和作者信息。
 
-![关于](resources/关于.png)
+![关于](Kiro-account-manager/resources/关于.png)
 
 ---
 
