@@ -912,6 +912,13 @@ const api = {
 
   // ============ 托盘相关 API ============
 
+  // 获取显示主窗口快捷键
+  getShowWindowShortcut: (): Promise<string> => ipcRenderer.invoke('get-show-window-shortcut'),
+
+  // 设置显示主窗口快捷键
+  setShowWindowShortcut: (shortcut: string): Promise<{ success: boolean; error?: string }> => 
+    ipcRenderer.invoke('set-show-window-shortcut', shortcut),
+
   // 获取托盘设置
   getTraySettings: (): Promise<{
     enabled: boolean

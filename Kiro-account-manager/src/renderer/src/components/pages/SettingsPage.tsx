@@ -156,6 +156,65 @@ export function SettingsPage() {
   })
   const [trayLoading, setTrayLoading] = useState(true)
 
+  // 快捷键设置状态
+  const [showWindowShortcut, setShowWindowShortcut] = useState('')
+  const [shortcutLoading, setShortcutLoading] = useState(true)
+  const [shortcutError, setShortcutError] = useState('')
+  const [isRecordingShortcut, setIsRecordingShortcut] = useState(false)
+
+  // 加载快捷键设置
+  useEffect(() => {
+    const loadShortcut = async () => {
+      try {
+        const shortcut = await window.api.getShowWindowShortcut()
+        setShowWindowShortcut(shortcut)
+      } catch (error) {
+        console.error('Failed to load shortcut:', error)
+      } finally {
+        setShortcutLoading(false)
+      }
+    }
+    loadShortcut()
+  }, [])
+
+  // 保存快捷键设置
+  const handleShortcutChange = async (shortcut: string) => {
+    setShowWindowShortcut(shortcut)
+    setShortcutError('')
+    try {
+      const result = await window.api.setShowWindowShortcut(shortcut)
+      if (!result.success) {
+        setShortcutError(result.error || 'Failed to set shortcut')
+      }
+    } catch (error) {
+      setShortcutError(String(error))
+    }
+  }
+
+  // 按键录制处理
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!isRecordingShortcut) return
+    e.preventDefault()
+    
+    const parts: string[] = []
+    if (e.ctrlKey) parts.push('Ctrl')
+    if (e.metaKey) parts.push('Command')
+    if (e.altKey) parts.push('Alt')
+    if (e.shiftKey) parts.push('Shift')
+    
+    // 忽略单独的修饰键
+    const key = e.key
+    if (!['Control', 'Meta', 'Alt', 'Shift'].includes(key)) {
+      // 转换特殊键名
+      const keyName = key.length === 1 ? key.toUpperCase() : key
+      parts.push(keyName)
+      
+      const shortcut = parts.join('+')
+      handleShortcutChange(shortcut)
+      setIsRecordingShortcut(false)
+    }
+  }
+
   // Usage API 类型状态
   const [usageApiType, setUsageApiType] = useState<'rest' | 'cbor'>('rest')
   const [usageApiLoading, setUsageApiLoading] = useState(true)
@@ -823,6 +882,62 @@ export function SettingsPage() {
                 <p>• {isEn ? 'Double-click tray icon to show window' : '双击托盘图标可以显示主窗口'}</p>
                 <p>• {isEn ? 'Right-click tray icon to show menu' : '右键托盘图标可以显示菜单'}</p>
                 <p>• {isEn ? 'Tray menu shows current account info and usage' : '托盘菜单可以查看当前账户信息和用量'}</p>
+              </div>
+            </>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* 快捷键设置 */}
+      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+        <CardHeader className="pb-2">
+          <CardTitle className="text-base flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-primary/10">
+              <Settings className="h-4 w-4 text-primary" />
+            </div>
+            {isEn ? 'Keyboard Shortcuts' : '快捷键'}
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {shortcutLoading ? (
+            <div className="text-sm text-muted-foreground">{isEn ? 'Loading...' : '加载中...'}</div>
+          ) : (
+            <>
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="font-medium">{isEn ? 'Show Window' : '显示主窗口'}</p>
+                  <p className="text-sm text-muted-foreground">{isEn ? 'Global shortcut to show main window' : '全局快捷键唤起主窗口'}</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    className={`w-[160px] h-9 px-3 rounded-lg border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary text-center ${isRecordingShortcut ? 'border-primary ring-1 ring-primary animate-pulse' : ''}`}
+                    value={isRecordingShortcut ? (isEn ? 'Press keys...' : '请按键...') : showWindowShortcut}
+                    onKeyDown={handleKeyDown}
+                    onFocus={() => setIsRecordingShortcut(true)}
+                    onBlur={() => setIsRecordingShortcut(false)}
+                    readOnly
+                    placeholder={isEn ? 'Click to record' : '点击录制'}
+                  />
+                  {showWindowShortcut && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-9 px-2"
+                      onClick={() => handleShortcutChange('')}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  )}
+                </div>
+              </div>
+              {shortcutError && (
+                <p className="text-sm text-destructive">{shortcutError}</p>
+              )}
+              <div className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-3 space-y-1">
+                <p>• {isEn ? 'Click input and press key combination to record' : '点击输入框后按下组合键自动录制'}</p>
+                <p>• {isEn ? 'macOS use Command, Windows/Linux use Ctrl' : 'macOS 使用 Command，Windows/Linux 使用 Ctrl'}</p>
+                <p>• {isEn ? 'Click trash icon to clear shortcut' : '点击垃圾桶图标可清除快捷键'}</p>
               </div>
             </>
           )}

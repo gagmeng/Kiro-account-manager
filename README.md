@@ -283,6 +283,9 @@ The project is configured with GitHub Actions workflow for auto building all pla
 - 🔄 **API Type Switch**: Support both REST API (GetUsageLimits) and CBOR API (GetUsage) modes
 - 🌐 **Proxy Request Support**: Kiro API requests can be sent through K-Proxy using undici library
 - 📊 **Usage Query Enhancement**: Unified usage query interface with automatic API type adaptation
+- ⌨️ **Global Shortcut**: Added show window shortcut with customizable key binding and key recording
+- 🍎 **macOS Shutdown Fix**: Fixed app blocking shutdown, added 3s timeout for force quit
+- 🍎 **macOS Dock Optimization**: Click Dock icon to show main window directly (like WeChat)
 
 ### v1.4.5 (2025-01-21)
 - 🐛 **Enterprise Account Dedup Fix**: Fixed enterprise accounts (no email) being incorrectly flagged as duplicates, now uses userId for checking

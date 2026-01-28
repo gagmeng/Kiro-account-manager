@@ -698,6 +698,8 @@ interface KiroApi {
   // ============ 托盘相关 API ============
 
   // 获取托盘设置
+  getShowWindowShortcut: () => Promise<string>
+  setShowWindowShortcut: (shortcut: string) => Promise<{ success: boolean; error?: string }>
   getTraySettings: () => Promise<{
     enabled: boolean
     closeAction: 'ask' | 'minimize' | 'quit'

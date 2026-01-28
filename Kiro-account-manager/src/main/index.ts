@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join } from 'path'
@@ -1128,6 +1128,57 @@ let mainWindow: BrowserWindow | null = null
 // ============ 托盘相关变量 ============
 let traySettings: TraySettings = { ...defaultTraySettings }
 let isQuitting = false // 标记是否真正退出应用
+
+// ============ 全局快捷键设置 ============
+let showWindowShortcut = process.platform === 'darwin' ? 'Command+Shift+K' : 'Ctrl+Shift+K'
+
+// 加载快捷键设置
+async function loadShortcutSettings(): Promise<void> {
+  try {
+    await initStore()
+    const saved = store?.get('showWindowShortcut') as string | undefined
+    if (saved) {
+      showWindowShortcut = saved
+    }
+  } catch (error) {
+    console.error('[Shortcut] Failed to load shortcut settings:', error)
+  }
+}
+
+// 保存快捷键设置
+async function saveShortcutSettings(): Promise<void> {
+  try {
+    await initStore()
+    store?.set('showWindowShortcut', showWindowShortcut)
+  } catch (error) {
+    console.error('[Shortcut] Failed to save shortcut settings:', error)
+  }
+}
+
+// 注册显示主窗口的快捷键
+function registerShowWindowShortcut(): void {
+  // 先注销所有已注册的快捷键
+  globalShortcut.unregisterAll()
+  
+  if (!showWindowShortcut) return
+  
+  try {
+    const success = globalShortcut.register(showWindowShortcut, () => {
+      if (mainWindow) {
+        if (mainWindow.isMinimized()) mainWindow.restore()
+        mainWindow.show()
+        mainWindow.focus()
+      }
+    })
+    if (success) {
+      console.log(`[Shortcut] Registered: ${showWindowShortcut}`)
+    } else {
+      console.warn(`[Shortcut] Failed to register: ${showWindowShortcut}`)
+    }
+  } catch (error) {
+    console.error('[Shortcut] Error registering shortcut:', error)
+  }
+}
 let currentProxyAccount: { id: string; email: string; idp: string; status: string; subscription?: string; usage?: { usedCredits: number; totalCredits: number; totalRequests: number; successRequests: number; failedRequests: number } } | null = null
 let allAccounts: { id: string; email: string; idp: string; status: string }[] = []
 
@@ -1469,6 +1520,23 @@ app.whenReady().then(async () => {
   // IPC: 获取托盘设置
   ipcMain.handle('get-tray-settings', () => {
     return traySettings
+  })
+
+  // IPC: 获取显示主窗口快捷键
+  ipcMain.handle('get-show-window-shortcut', () => {
+    return showWindowShortcut
+  })
+
+  // IPC: 设置显示主窗口快捷键
+  ipcMain.handle('set-show-window-shortcut', async (_event, shortcut: string) => {
+    try {
+      showWindowShortcut = shortcut
+      await saveShortcutSettings()
+      registerShowWindowShortcut()
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: String(error) }
+    }
   })
 
   // IPC: 保存托盘设置
@@ -5235,8 +5303,19 @@ app.whenReady().then(async () => {
   app.on('activate', function () {
     // On macOS it's common to re-create a window in the app when the
     // dock icon is clicked and there are no other windows open.
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow()
+    } else if (mainWindow) {
+      // macOS: 点击 Dock 图标时显示主窗口（像微信一样）
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    }
   })
+
+  // 加载并注册全局快捷键
+  await loadShortcutSettings()
+  registerShowWindowShortcut()
 })
 
 // Windows/Linux: 处理第二个实例和协议 URL
@@ -5276,9 +5355,20 @@ app.on('window-all-closed', () => {
 
 // 应用退出前注销 URI 协议处理器并保存数据
 app.on('will-quit', async (event) => {
+  // 防止重复处理
+  if (isQuitting) return
+  
   // 防止应用立即退出，先保存数据
   if (lastSavedData && store) {
     event.preventDefault()
+    isQuitting = true
+    
+    // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
+    const forceQuitTimer = setTimeout(() => {
+      console.log('[Exit] Force quit due to timeout')
+      unregisterProtocol()
+      app.exit(0)
+    }, 3000)
     
     try {
       console.log('[Exit] Saving data before quit...')
@@ -5289,6 +5379,7 @@ app.on('will-quit', async (event) => {
       console.error('[Exit] Failed to save data:', error)
     }
     
+    clearTimeout(forceQuitTimer)
     unregisterProtocol()
     app.exit(0)
   } else {
