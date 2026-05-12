@@ -83,7 +83,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
@@ -133,7 +133,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
@@ -183,7 +183,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
@@ -237,7 +237,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build
         working-directory: ${{ env.WORKING_DIR }}
