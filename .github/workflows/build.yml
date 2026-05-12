@@ -71,6 +71,9 @@ jobs:
       - name: Install setuptools (for node-gyp)
         run: pip install setuptools
 
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -117,6 +120,9 @@ jobs:
 
       - name: Install setuptools (for node-gyp)
         run: pip install setuptools
+
+      - name: Setup MSVC Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
