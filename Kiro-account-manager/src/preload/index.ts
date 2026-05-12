@@ -677,8 +677,8 @@ const api = {
   },
 
   // 获取账户可用模型列表
-  accountGetModels: (accessToken: string, region?: string, profileArn?: string): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }> => {
-    return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn)
+  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }> => {
+    return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn, machineId, provider, authMethod, accountId)
   },
 
   // 获取可用订阅列表

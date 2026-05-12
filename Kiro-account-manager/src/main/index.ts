@@ -2418,7 +2418,7 @@ app.whenReady().then(async () => {
         const [userInfoResult, usageResult] = await Promise.all([
           getUserInfo(accessToken, idp, accountMachineId).catch((err: Error) => {
             // 封禁错误不能吞掉，必须向上抛出
-            if (err.message.includes('423') || err.message.includes('AccountSuspended') || err.message.includes('403')) {
+            if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
               throw err
             }
             return undefined
@@ -2429,8 +2429,8 @@ app.whenReady().then(async () => {
       } catch (apiError) {
         const errorMsg = apiError instanceof Error ? apiError.message : ''
         
-        // 检查是否是封禁错误（403、423 或 AccountSuspendedException）
-        if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423') || errorMsg.includes('403')) {
+        // 检查是否是明确封禁错误（423 或 AccountSuspendedException）
+        if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
           console.log('[IPC] Account suspended/banned')
           return {
             success: false,
@@ -2459,7 +2459,7 @@ app.whenReady().then(async () => {
             // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
             const [userInfoResult, usageResult] = await Promise.all([
               getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
-                if (err.message.includes('423') || err.message.includes('AccountSuspended') || err.message.includes('403')) {
+                if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
                   throw err
                 }
                 return undefined
@@ -2908,7 +2908,7 @@ app.whenReady().then(async () => {
                 idp?: string
               }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp).catch((err: Error) => {
                 // 封禁错误不能吞掉，需要在后续逻辑中检测
-                if (err.message.includes('423') || err.message.includes('AccountSuspended') || err.message.includes('403')) {
+                if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
                   throw err
                 }
                 return null
@@ -3083,7 +3083,7 @@ app.whenReady().then(async () => {
             } else if (userInfoRes.status === 'rejected') {
               // GetUserInfo 失败（封禁错误会到这里）
               const errMsg = userInfoRes.reason?.message || String(userInfoRes.reason)
-              if (errMsg.includes('423') || errMsg.includes('AccountSuspended') || errMsg.includes('403')) {
+              if (errMsg.includes('423') || errMsg.includes('AccountSuspended')) {
                 status = 'error'
                 errorMessage = errMsg
               }
@@ -5153,9 +5153,17 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取账户可用模型列表
-  ipcMain.handle('account-get-models', async (_event, accessToken: string, region?: string, profileArn?: string) => {
+  ipcMain.handle('account-get-models', async (_event, accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => {
     try {
-      const models = await fetchKiroModels({ accessToken, region: region || 'us-east-1', profileArn } as ProxyAccount)
+      const models = await fetchKiroModels({
+        id: accountId || 'model-list-request',
+        accessToken,
+        region: region || 'us-east-1',
+        profileArn,
+        machineId,
+        provider,
+        authMethod: authMethod as ProxyAccount['authMethod']
+      } as ProxyAccount)
       return {
         success: true,
         models: models.map(m => ({

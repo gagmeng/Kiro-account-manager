@@ -97,14 +97,61 @@ export class Registrar {
 
   /** 初始化 TLS 客户端 */
   private async initTlsClient(): Promise<void> {
+    // 确保 tls-client 共享库在临时目录可用（打包后 resources/ 有预置 dll）
+    this.ensureTlsLibInTmpDir()
+    // 不传 customLibraryPath，让 tlsclientwrapper 自动从 tmpdir 找 dll
     this.moduleClient = new ModuleClient()
+    await this.moduleClient.open()
+    this.log('[TLS] open() completed, pool stats: ' + JSON.stringify(this.moduleClient.getPoolStats()))
     this.session = new SessionClient(this.moduleClient, this.sessionOpts)
   }
 
-  /** 重建 session（处理 EOF / stale connection） */
-  private async rebuildSession(): Promise<void> {
+  /** 确保 tls-client 共享库在临时目录可用 */
+  private ensureTlsLibInTmpDir(): void {
+    const os = require('os')
+    const path = require('path')
+    const fs = require('fs')
+    const platform = os.platform()
+    const arch = os.arch()
+    let filename = 'tls-client-xgo-1.14.0-'
+    if (platform === 'win32') {
+      filename += (arch.includes('64') ? 'windows-amd64' : 'windows-386') + '.dll'
+    } else if (platform === 'darwin') {
+      filename += (arch === 'arm64' ? 'darwin-arm64' : 'darwin-amd64') + '.dylib'
+    } else {
+      filename += (arch === 'arm64' ? 'linux-arm64' : 'linux-amd64') + '.so'
+    }
+    const tmpPath = path.join(os.tmpdir(), filename)
+    // 已存在则跳过
+    if (fs.existsSync(tmpPath)) {
+      this.log('[TLS] Library already exists in tmpdir: ' + tmpPath)
+      return
+    }
+    // 从 resources/ 复制到临时目录（打包后 process.resourcesPath 指向 resources/）
+    const resourcePath = path.join(process.resourcesPath || '', filename)
+    if (fs.existsSync(resourcePath)) {
+      this.log('[TLS] Copying library from resources to tmpdir: ' + resourcePath + ' -> ' + tmpPath)
+      fs.copyFileSync(resourcePath, tmpPath)
+      return
+    }
+    this.log('[TLS] Library not found in resources, will download from GitHub. Searched: ' + resourcePath)
+  }
+
+  private async rebuildTlsClient(): Promise<void> {
     try { await this.session?.destroySession() } catch { /* ignore */ }
-    this.session = new SessionClient(this.moduleClient!, this.sessionOpts)
+    this.session = null
+    if (this.moduleClient) {
+      try { await this.moduleClient.terminate() } catch { /* ignore */ }
+      this.moduleClient = null
+    }
+    await this.initTlsClient()
+  }
+
+  private isRecoverableTlsClientError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false
+    return err.message.includes('EOF')
+      || err.message.includes('no tls client for modification check')
+      || err.message.includes('failed to modify existing client')
   }
 
   /** 清理 TLS 客户端资源 */
@@ -187,8 +234,9 @@ export class Registrar {
       const resp = await this.session.get(url, { headers })
       return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
     } catch (err: unknown) {
-      if (err instanceof Error && err.message.includes('EOF')) {
-        await this.rebuildSession()
+      if (this.isRecoverableTlsClientError(err)) {
+        this.log('[TLS] Recoverable GET error, rebuilding TLS client: ' + (err instanceof Error ? err.message : String(err)))
+        await this.rebuildTlsClient()
         const resp = await this.session!.get(url, { headers })
         return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
       }
@@ -203,8 +251,9 @@ export class Registrar {
       const resp = await this.session.post(url, body, { headers })
       return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
     } catch (err: unknown) {
-      if (err instanceof Error && err.message.includes('EOF')) {
-        await this.rebuildSession()
+      if (this.isRecoverableTlsClientError(err)) {
+        this.log('[TLS] Recoverable POST error, rebuilding TLS client: ' + (err instanceof Error ? err.message : String(err)))
+        await this.rebuildTlsClient()
         const resp = await this.session!.post(url, body, { headers })
         return { body: resp.body || '', status: resp.status, headers: (resp.headers || {}) as Record<string, string | string[]> }
       }
@@ -308,7 +357,7 @@ export class Registrar {
         if (attempt < 2) {
           this.log(`[1] OIDC 重试 (${attempt + 1}/3)...`)
           await sleep(2000 * (attempt + 1))
-          await this.rebuildSession()
+          await this.rebuildTlsClient()
           continue
         }
         throw err
@@ -997,9 +1046,10 @@ export class Registrar {
     try {
       await this.initTlsClient()
       await refreshAppJSConfig(async (url, init) => {
-        const resp = await this.session!.get(url, { headers: (init?.headers as Record<string, string>) || {} })
+        const resp = await this.doGet(url, (init?.headers as Record<string, string>) || {})
         return new Response(resp.body, { status: resp.status })
       })
+      await this.rebuildTlsClient()
 
       const initSteps: Array<{ name: string; fn: StepFn }> = [
         { name: 'OIDC', fn: () => this.step1OIDC() },
@@ -1092,9 +1142,10 @@ export class Registrar {
     try {
       await this.initTlsClient()
       await refreshAppJSConfig(async (url, init) => {
-        const resp = await this.session!.get(url, { headers: (init?.headers as Record<string, string>) || {} })
+        const resp = await this.doGet(url, (init?.headers as Record<string, string>) || {})
         return new Response(resp.body, { status: resp.status })
       })
+      await this.rebuildTlsClient()
 
       await this.step1OIDC()
       await this.step2Device()

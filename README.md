@@ -271,6 +271,27 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 ## 📋 Changelog
 
+### v1.6.1 (2026-5-12)
+
+#### API Proxy Compatibility
+- **Fixed**: OpenCode compaction requests with historical tool calls no longer fail with Kiro API `400 Improperly formed request`
+- **Fixed**: Added official Kiro-style conversation sanitization for native history mode, including tool result relocation, orphan tool result removal, missing tool result completion, message alternation, and final validation
+- **Fixed**: Historical tool calls/results are converted to plain text when the current request does not include matching tool definitions, preserving compaction context while avoiding Kiro backend tool schema validation errors
+- **Fixed**: AmazonQ CLI endpoint now uses the correct `CLI` origin for `/SendMessageStreaming`, and the ineffective automatic fallback from `amazonq-cli` to IDE protocol endpoints was removed
+- **Improved**: Kiro request diagnostics now include current tool results, history message count, and historical tool use/result counts for easier payload troubleshooting
+
+#### Client Configuration
+- **Fixed**: One-click client configuration no longer shows "No models loaded" after a fresh install and adding the first account when the direct account model query returns an empty list
+- **Fixed**: Account model loading now passes full account identity fields (`machineId`, `provider`, `authMethod`, `accountId`) to `ListAvailableModels`
+- **Fixed**: One-click client configuration falls back to proxy model loading when account-level model loading succeeds with an empty model list
+- **Fixed**: Account detail model list uses the same complete account identity fields, improving model loading consistency for newly added accounts
+
+#### Account Refresh & Status
+- **Fixed**: Network errors such as `fetch failed`, token expiration, refresh failures, and `UnauthorizedException` are no longer counted as banned accounts
+- **Fixed**: Auto refresh only skips accounts with explicit suspension signals (`AccountSuspendedException`, `AccountSuspended`, or HTTP `423`), so transient network/token errors can still be retried in later refresh cycles
+- **Fixed**: Account cards, account selection dialog, banned-account filter, and banned statistics now share stricter suspension detection logic
+- **Fixed**: Plain HTTP `403` is no longer treated as a ban signal during account status checks
+
 ### v1.6.0 (2026-5-12)
 
 #### API Proxy Enhancement

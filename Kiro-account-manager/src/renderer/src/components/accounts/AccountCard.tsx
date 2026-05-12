@@ -296,11 +296,14 @@ export const AccountCard = memo(function AccountCard({
   const isHighUsage = account.usage.percentUsed > 80
 
   // 检测账号是否被封禁/暂停（多种错误格式）
-  const isUnauthorized = account.lastError?.includes('UnauthorizedException') || 
-                         account.lastError?.includes('AccountSuspendedException') ||
-                         account.lastError?.includes('账户已封禁') ||
-                         account.lastError?.includes('HTTP 403') ||
-                         account.lastError?.includes('HTTP 423')
+  const lowerError = account.lastError?.toLowerCase()
+  const isUnauthorized = !!lowerError && (
+    lowerError.includes('accountsuspendedexception') ||
+    lowerError.includes('account suspended') ||
+    lowerError.includes('账户已封禁') ||
+    lowerError.includes('已封禁') ||
+    /\b423\b/.test(lowerError)
+  )
   
   // 封禁详情弹窗状态
   const [showBanDialog, setShowBanDialog] = useState(false)

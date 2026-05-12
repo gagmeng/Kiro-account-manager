@@ -108,16 +108,20 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
         ? activeAccount
         : Array.from(accounts.values()).find(item => item.status === 'active' && item.credentials?.accessToken)
       if (account) {
-        const accountModels = await window.api.accountGetModels(account.credentials.accessToken, account.credentials.region || 'us-east-1', account.profileArn)
-        if (!accountModels.success) {
-          setModels([])
-          setSelectedModelId('')
-          setError(accountModels.error || (isEn ? 'Failed to load account models' : '加载账号模型失败'))
+        const accountModels = await window.api.accountGetModels(
+          account.credentials.accessToken,
+          account.credentials.region || 'us-east-1',
+          account.profileArn,
+          account.machineId,
+          account.credentials.provider || account.idp,
+          account.credentials.authMethod,
+          account.id
+        )
+        if (accountModels.success && accountModels.models.length > 0) {
+          setModels(accountModels.models)
+          setSelectedModelId(current => accountModels.models.some(model => model.id === current) ? current : accountModels.models[0]?.id || '')
           return
         }
-        setModels(accountModels.models)
-        setSelectedModelId(current => accountModels.models.some(model => model.id === current) ? current : accountModels.models[0]?.id || '')
-        return
       }
 
       const proxyModels = await window.api.proxyGetModels()
@@ -127,17 +131,12 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
         return
       }
 
-      if (!proxyModels.success) {
-        setModels([])
-        setSelectedModelId('')
-        setError(proxyModels.error || (isEn ? 'No active account is available for loading models' : '没有可用于加载模型的活跃账号'))
-        return
-      }
-
       setModels([])
       setSelectedModelId('')
-      setError(isEn ? 'No models are available' : '没有可用模型')
+      setError(isEn ? 'No models were loaded. Please check whether the account is active and try reloading.' : '未加载到模型，请确认账号已激活后重新加载。')
     } catch (err) {
+      setModels([])
+      setSelectedModelId('')
       setError(err instanceof Error ? err.message : (isEn ? 'Failed to load models' : '加载模型失败'))
     } finally {
       setLoadingModels(false)

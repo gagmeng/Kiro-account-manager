@@ -3,6 +3,7 @@ import http from 'http'
 import https from 'https'
 import fs from 'fs'
 import { v4 as uuidv4 } from 'uuid'
+import type { Socket } from 'net'
 import type {
   OpenAIChatRequest,
   OpenAIMessage,
@@ -238,6 +239,9 @@ export class ProxyServer {
   private events: ProxyServerEvents
   private refreshingTokens: Set<string> = new Set() // 防止并发刷新
   private isHttps: boolean = false
+  private isStopping: boolean = false
+  private activeRequests: Set<AbortController> = new Set()
+  private sockets: Set<Socket> = new Set()
 
   constructor(config: Partial<ProxyConfig> = {}, events: ProxyServerEvents = {}) {
     this.config = {
@@ -288,6 +292,7 @@ export class ProxyServer {
     }
 
     return new Promise((resolve, reject) => {
+      this.isStopping = false
       const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => 
         this.handleRequest(req, res)
 
@@ -317,12 +322,17 @@ export class ProxyServer {
         this.events.onError?.(error)
       })
 
+      this.server.on('connection', (socket: Socket) => {
+        this.sockets.add(socket)
+        socket.on('close', () => this.sockets.delete(socket))
+      })
+
       // 服务器关闭时尝试自动重启
       this.server.on('close', () => {
-        if (this.config.autoStart && this.config.enabled) {
+        if (!this.isStopping && this.config.autoStart && this.config.enabled) {
           console.log('[ProxyServer] Server closed unexpectedly, attempting restart in 3s...')
           setTimeout(() => {
-            if (this.config.autoStart && !this.isRunning()) {
+            if (!this.isStopping && this.config.autoStart && !this.isRunning()) {
               console.log('[ProxyServer] Auto-restarting...')
               this.start().catch(err => {
                 console.error('[ProxyServer] Auto-restart failed:', err)
@@ -377,13 +387,20 @@ export class ProxyServer {
       return
     }
 
+    this.isStopping = true
+
     return new Promise((resolve) => {
       this.server!.close(() => {
         proxyLogger.info('ProxyServer', 'Stopped')
         this.server = null
+        this.isStopping = false
+        this.activeRequests.clear()
+        this.sockets.clear()
         this.events.onStatusChange?.(false, this.config.port)
         resolve()
       })
+      this.activeRequests.forEach(controller => controller.abort(new Error('Proxy server stopped')))
+      this.sockets.forEach(socket => socket.destroy())
     })
   }
 
@@ -437,10 +454,13 @@ export class ProxyServer {
     request.tools?.forEach(tool => this.validateCacheControl(tool.cache_control))
   }
 
-  private async downloadImageDataUrl(url: string): Promise<string> {
+  private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), 15000)
+    const abort = () => controller.abort(this.getAbortError(signal))
     try {
+      if (signal?.aborted) throw this.getAbortError(signal)
+      signal?.addEventListener('abort', abort, { once: true })
       const agent = (() => {
         const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
         if (envProxy) {
@@ -467,26 +487,27 @@ export class ProxyServer {
       return `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
     } finally {
       clearTimeout(timeout)
+      signal?.removeEventListener('abort', abort)
     }
   }
 
-  private async resolveOpenAIHttpImages(request: OpenAIChatRequest): Promise<OpenAIChatRequest> {
+  private async resolveOpenAIHttpImages(request: OpenAIChatRequest, signal?: AbortSignal): Promise<OpenAIChatRequest> {
     await Promise.all(request.messages.map(async message => {
       if (!Array.isArray(message.content)) return
       await Promise.all(message.content.map(async part => {
         if (part.type !== 'image_url' || !part.image_url?.url.startsWith('http')) return
-        part.image_url.url = await this.downloadImageDataUrl(part.image_url.url)
+        part.image_url.url = await this.downloadImageDataUrl(part.image_url.url, signal)
       }))
     }))
     return request
   }
 
-  private async resolveClaudeHttpImages(request: ClaudeRequest): Promise<ClaudeRequest> {
+  private async resolveClaudeHttpImages(request: ClaudeRequest, signal?: AbortSignal): Promise<ClaudeRequest> {
     await Promise.all(request.messages.map(async message => {
       if (!Array.isArray(message.content)) return
       await Promise.all(message.content.map(async block => {
         if (block.type !== 'image' || block.source?.type !== 'url') return
-        const dataUrl = await this.downloadImageDataUrl(block.source.url)
+        const dataUrl = await this.downloadImageDataUrl(block.source.url, signal)
         const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/)
         if (!match) {
           throw new Error('Downloaded image produced invalid data URL')
@@ -651,6 +672,61 @@ export class ProxyServer {
     return this.server !== null
   }
 
+  private getAbortError(signal?: AbortSignal): Error {
+    if (signal?.reason instanceof Error) return signal.reason
+    if (signal?.reason) return new Error(String(signal.reason))
+    return new Error('Request aborted')
+  }
+
+  private isAbortError(error: unknown, signal?: AbortSignal): boolean {
+    return signal?.aborted === true
+      || (error instanceof Error && (error.message.includes('Client disconnected') || error.message.includes('Proxy server stopped')))
+  }
+
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw this.getAbortError(signal)
+  }
+
+  private throwIfResponseClosed(res: http.ServerResponse, signal?: AbortSignal): void {
+    this.throwIfAborted(signal)
+    if (res.writableEnded || res.destroyed) throw new Error('Client disconnected')
+  }
+
+  private isResponseClosed(res: http.ServerResponse): boolean {
+    return res.writableEnded || res.destroyed
+  }
+
+  private waitForRetry(ms: number, signal?: AbortSignal): Promise<void> {
+    this.throwIfAborted(signal)
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        signal?.removeEventListener('abort', abort)
+        resolve()
+      }, ms)
+      const abort = () => {
+        clearTimeout(timeout)
+        reject(this.getAbortError(signal))
+      }
+      signal?.addEventListener('abort', abort, { once: true })
+    })
+  }
+
+  private async abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+    this.throwIfAborted(signal)
+    if (!signal) return promise
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        const abort = () => reject(this.getAbortError(signal))
+        signal.addEventListener('abort', abort, { once: true })
+        promise.then(
+          () => signal.removeEventListener('abort', abort),
+          () => signal.removeEventListener('abort', abort)
+        )
+      })
+    ])
+  }
+
   // 清除模型缓存，强制下次请求重新获取
   clearModelCache(): void {
     this.modelCache = null
@@ -675,25 +751,28 @@ export class ProxyServer {
     }
   }
 
-  async getAvailableModels(): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
+  async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
     const now = Date.now()
     
     if (this.modelCache && (now - this.modelCache.timestamp) < this.MODEL_CACHE_TTL) {
       return { models: this.modelCache.models.map(ProxyServer.mapKiroModelToApi), fromCache: true }
     }
 
-    const account = await this.getAvailableAccount()
+    this.throwIfAborted(signal)
+    const account = await this.getAvailableAccount(signal)
+    this.throwIfAborted(signal)
     if (!account) {
       return { models: [], fromCache: false }
     }
 
     try {
-      const kiroModels = await fetchKiroModels(account)
+      const kiroModels = await fetchKiroModels(account, signal)
       if (kiroModels.length > 0) {
         this.modelCache = { models: kiroModels, timestamp: now }
       }
       return { models: kiroModels.map(ProxyServer.mapKiroModelToApi), fromCache: false }
     } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
       console.error('[ProxyServer] Failed to fetch models:', error)
       return { models: [], fromCache: false }
     }
@@ -707,7 +786,8 @@ export class ProxyServer {
   }
 
   // 刷新 Token
-  private async refreshToken(account: ProxyAccount): Promise<boolean> {
+  private async refreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
+    this.throwIfAborted(signal)
     if (!this.events.onTokenRefresh) {
       console.warn('[ProxyServer] No token refresh callback configured')
       return false
@@ -717,7 +797,7 @@ export class ProxyServer {
     if (this.refreshingTokens.has(account.id)) {
       console.log(`[ProxyServer] Token refresh already in progress for ${account.email || account.id}`)
       // 等待刷新完成
-      await new Promise(resolve => setTimeout(resolve, 1000))
+      await this.waitForRetry(1000, signal)
       return !this.isTokenExpiringSoon(this.accountPool.getAccount(account.id) || account)
     }
 
@@ -727,9 +807,9 @@ export class ProxyServer {
     try {
       // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作
       const jitter = Math.floor(Math.random() * 3000)
-      if (jitter > 0) await new Promise(resolve => setTimeout(resolve, jitter))
+      if (jitter > 0) await this.waitForRetry(jitter, signal)
       
-      const result = await this.events.onTokenRefresh(account)
+      const result = await this.abortable(this.events.onTokenRefresh(account), signal)
       if (result.success && result.accessToken) {
         // 更新账号池中的 Token
         this.accountPool.updateAccount(account.id, {
@@ -752,6 +832,7 @@ export class ProxyServer {
         return false
       }
     } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
       console.error(`[ProxyServer] Token refresh error for ${account.email || account.id}:`, error)
       this.accountPool.markNeedsRefresh(account.id)
       return false
@@ -761,12 +842,14 @@ export class ProxyServer {
   }
 
   // 获取可用账号（包含 Token 刷新检查）
-  private async getAvailableAccount(): Promise<ProxyAccount | null> {
+  private async getAvailableAccount(signal?: AbortSignal): Promise<ProxyAccount | null> {
+    this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
       console.log('[ProxyServer] Account pool empty, triggering lazy sync...')
-      await this.events.onPoolEmpty()
+      await this.abortable(this.events.onPoolEmpty(), signal)
     }
+    this.throwIfAborted(signal)
 
     let account: ProxyAccount | null
     
@@ -813,7 +896,7 @@ export class ProxyServer {
 
     // 检查是否需要刷新 Token
     if (this.isTokenExpiringSoon(account)) {
-      const refreshed = await this.refreshToken(account)
+      const refreshed = await this.refreshToken(account, signal)
       if (!refreshed) {
         // 刷新失败，如果启用多账号才尝试获取下一个账号
         if (this.config.enableMultiAccount) {
@@ -858,7 +941,8 @@ export class ProxyServer {
   private async callWithRetry<T>(
     account: ProxyAccount,
     apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
-    _path: string // 用于日志
+    _path: string,
+    signal?: AbortSignal
   ): Promise<{ result: T; account: ProxyAccount }> {
     const maxRetries = this.config.maxRetries || 3
     const retryDelay = this.config.retryDelayMs || 1000
@@ -867,10 +951,12 @@ export class ProxyServer {
     let endpointIndex = 0
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      this.throwIfAborted(signal)
       try {
         const result = await apiCall(currentAccount, endpointIndex)
         return { result, account: currentAccount }
       } catch (error) {
+        if (this.isAbortError(error, signal)) throw error
         lastError = error as Error
         const errMsg = lastError.message || ''
 
@@ -879,7 +965,7 @@ export class ProxyServer {
         // 401/403: 尝试刷新 Token
         if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
           console.log('[ProxyServer] Auth error, attempting token refresh')
-          const refreshed = await this.refreshToken(currentAccount)
+          const refreshed = await this.refreshToken(currentAccount, signal)
           if (refreshed) {
             currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
             continue
@@ -925,7 +1011,7 @@ export class ProxyServer {
         // 5xx: 重试
         if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
           console.log('[ProxyServer] Server error, retrying')
-          await new Promise(resolve => setTimeout(resolve, retryDelay * (attempt + 1)))
+          await this.waitForRetry(retryDelay * (attempt + 1), signal)
           continue
         }
 
@@ -1097,79 +1183,100 @@ export class ProxyServer {
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const path = req.url || '/'
     const method = req.method || 'GET'
+    const controller = new AbortController()
+    const abortRequest = () => {
+      if (!this.isStopping && res.writableEnded) return
+      if (!controller.signal.aborted) {
+        controller.abort(new Error(this.isStopping ? 'Proxy server stopped' : 'Client disconnected'))
+      }
+    }
+    this.activeRequests.add(controller)
+    req.on('aborted', abortRequest)
+    res.on('close', abortRequest)
 
     // CORS 预检
     if (method === 'OPTIONS') {
       this.setCorsHeaders(res)
       res.writeHead(204)
       res.end()
+      req.off('aborted', abortRequest)
+      res.off('close', abortRequest)
+      this.activeRequests.delete(controller)
       return
     }
 
-    this.setCorsHeaders(res)
-
-    // API Key 验证（健康检查端点除外）
-    if (path !== '/health' && path !== '/') {
-      const authResult = this.validateApiKey(req)
-      if (!authResult.valid) {
-        const errorMsg = authResult.reason || 'Invalid or missing API key'
-        const statusCode = authResult.reason === 'Credits limit exceeded' ? 429 : 401
-        this.sendError(res, statusCode, errorMsg, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
-        return
-      }
-      // 将匹配的 API Key 存储到请求对象中，用于后续统计
-      ;(req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey = authResult.apiKey
-    }
-
-    // 记录请求
-    if (this.config.logRequests) {
-      proxyLogger.info('ProxyServer', `${method} ${path}`)
-    }
-
     try {
+      this.setCorsHeaders(res)
+
+      // API Key 验证（健康检查端点除外）
+      if (path !== '/health' && path !== '/') {
+        const authResult = this.validateApiKey(req)
+        if (!authResult.valid) {
+          const errorMsg = authResult.reason || 'Invalid or missing API key'
+          const statusCode = authResult.reason === 'Credits limit exceeded' ? 429 : 401
+          this.sendError(res, statusCode, errorMsg, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
+          return
+        }
+        // 将匹配的 API Key 存储到请求对象中，用于后续统计
+        ;(req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey = authResult.apiKey
+      }
+
+      // 记录请求
+      if (this.config.logRequests) {
+        proxyLogger.info('ProxyServer', `${method} ${path}`)
+      }
+
       // 路由（移除查询参数）
       const pathWithoutQuery = path.split('?')[0]
       
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
-        await this.handleModels(res)
+        await this.handleModels(res, controller.signal)
       } else if (pathWithoutQuery === '/v1/chat/completions' || pathWithoutQuery === '/chat/completions') {
-        await this.handleOpenAIChat(req, res)
+        await this.handleOpenAIChat(req, res, controller.signal)
       } else if (pathWithoutQuery === '/v1/responses' || pathWithoutQuery === '/responses') {
-        await this.handleOpenAIResponses(req, res)
+        await this.handleOpenAIResponses(req, res, controller.signal)
       } else if (pathWithoutQuery === '/v1/messages' || pathWithoutQuery === '/messages' || pathWithoutQuery === '/anthropic/v1/messages') {
-        await this.handleClaudeMessages(req, res)
+        await this.handleClaudeMessages(req, res, controller.signal)
       } else if (pathWithoutQuery === '/v1/messages/count_tokens' || pathWithoutQuery === '/messages/count_tokens') {
         // Claude Code token 计数端点 - 返回模拟响应
-        this.handleCountTokens(req, res)
+        await this.handleCountTokens(req, res, controller.signal)
       } else if (pathWithoutQuery === '/api/event_logging/batch') {
         // Claude Code 遥测端点 - 直接返回 200 OK
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ status: 'ok' }))
       } else if (pathWithoutQuery.startsWith('/v1beta/models/')) {
         // Gemini v1beta 兼容路由
-        await this.handleGeminiRequest(req, res, pathWithoutQuery)
+        await this.handleGeminiRequest(req, res, pathWithoutQuery, controller.signal)
       } else if (pathWithoutQuery === '/v1beta/models') {
         // Gemini 模型列表
-        await this.handleGeminiModels(res)
+        await this.handleGeminiModels(res, controller.signal)
       } else if (pathWithoutQuery === '/health' || pathWithoutQuery === '/') {
         this.handleHealth(res)
       } else if (pathWithoutQuery.startsWith('/admin/')) {
         // 管理 API 端点
-        await this.handleAdminApi(req, res, pathWithoutQuery)
+        await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
       } else {
         // 记录未知路径以便调试
         console.log(`[ProxyServer] Unknown path: ${path} (method: ${method})`)
         this.sendError(res, 404, `Not Found: ${pathWithoutQuery}`)
       }
     } catch (error) {
+      if (this.isAbortError(error, controller.signal)) {
+        proxyLogger.info('ProxyServer', `Request aborted: ${method} ${path}`)
+        return
+      }
       console.error('[ProxyServer] Request error:', error)
       this.sendError(res, 500, (error as Error).message, this.isAnthropicPath(path) ? 'anthropic' : 'openai')
       this.events.onError?.(error as Error)
+    } finally {
+      req.off('aborted', abortRequest)
+      res.off('close', abortRequest)
+      this.activeRequests.delete(controller)
     }
   }
 
   // 管理 API 端点
-  private async handleAdminApi(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
+  private async handleAdminApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
     const method = req.method || 'GET'
 
     // 管理 API 需要 API Key 验证
@@ -1190,7 +1297,7 @@ export class ProxyServer {
       this.handleAdminConfig(res)
     } else if (path === '/admin/config' && method === 'POST') {
       // 更新配置
-      const body = await this.readBody(req)
+      const body = await this.readBody(req, signal)
       const newConfig = JSON.parse(body)
       this.updateConfig(newConfig)
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1346,9 +1453,11 @@ export class ProxyServer {
   }
 
   // Claude Code token 计数（模拟响应）
-  private async handleCountTokens(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+  private async handleCountTokens(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     try {
-      const body = await this.readBody(req)
+      this.throwIfAborted(signal)
+      const body = await this.readBody(req, signal)
+      this.throwIfAborted(signal)
       const request = JSON.parse(body) as Partial<ClaudeRequest>
       if (!Array.isArray(request.messages)) {
         throw new Error('count_tokens requires messages')
@@ -1358,13 +1467,14 @@ export class ProxyServer {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ input_tokens: estimatedTokens }))
     } catch (error) {
+      if (this.isAbortError(error, signal)) return
       this.sendError(res, 400, error instanceof Error ? error.message : 'Invalid request body', 'anthropic')
     }
   }
 
   // Gemini v1beta 模型列表
-  private async handleGeminiModels(res: http.ServerResponse): Promise<void> {
-    const result = await this.getAvailableModels()
+  private async handleGeminiModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const result = await this.getAvailableModels(signal)
     const geminiModels = result.models.map(m => ({
       name: `models/${m.id}`,
       version: '001',
@@ -1374,13 +1484,15 @@ export class ProxyServer {
       outputTokenLimit: m.maxOutputTokens || 64000,
       supportedGenerationMethods: ['generateContent', 'streamGenerateContent']
     }))
+    this.throwIfResponseClosed(res, signal)
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ models: geminiModels }))
   }
 
   // Gemini v1beta generateContent / streamGenerateContent
-  private async handleGeminiRequest(req: http.IncomingMessage, res: http.ServerResponse, path: string): Promise<void> {
-    const body = await this.readBody(req)
+  private async handleGeminiRequest(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    this.throwIfAborted(signal)
     const geminiReq = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
@@ -1420,7 +1532,9 @@ export class ProxyServer {
     // 复用 OpenAI 流程
     const startTime = Date.now()
     this.recordNewRequest()
-    const account = await this.getAvailableAccount()
+    this.throwIfAborted(signal)
+    const account = await this.getAvailableAccount(signal)
+    this.throwIfAborted(signal)
     if (!account) {
       this.sendError(res, 503, 'No available accounts')
       return
@@ -1438,12 +1552,17 @@ export class ProxyServer {
             account as ProxyAccount,
             kiroPayload,
             (text) => {
+              if (signal?.aborted || this.isResponseClosed(res)) return
               if (text) {
                 const chunk = { candidates: [{ content: { parts: [{ text }], role: 'model' }, finishReason: null }] }
                 res.write(`data: ${JSON.stringify(chunk)}\n\n`)
               }
             },
             (usage) => {
+              if (signal?.aborted || this.isResponseClosed(res)) {
+                resolve()
+                return
+              }
               const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.end()
@@ -1456,18 +1575,30 @@ export class ProxyServer {
               resolve()
             },
             (error) => {
+              if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+                resolve()
+                return
+              }
               res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
               res.end()
               this.recordRequestFailed()
               resolve()
             },
-            undefined,
+            signal,
             this.config.preferredEndpoint
-          )
+          ).catch(error => {
+            if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
+              res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+              res.end()
+              this.recordRequestFailed()
+            }
+            resolve()
+          })
         })
       } else {
         // 非流式
-        const result = await callKiroApi(account as ProxyAccount, kiroPayload)
+        const result = await callKiroApi(account as ProxyAccount, kiroPayload, signal)
+        this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -1477,7 +1608,7 @@ export class ProxyServer {
         }))
       }
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1beta', modelId, startTime)
+      this.handleApiError(res, account, error as Error, '/v1beta', modelId, startTime, signal)
     }
   }
 
@@ -1486,7 +1617,7 @@ export class ProxyServer {
   private readonly MODEL_CACHE_TTL = 5 * 60 * 1000 // 5 分钟缓存
 
   // 模型列表
-  private async handleModels(res: http.ServerResponse): Promise<void> {
+  private async handleModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
     const now = Date.now()
     
     // Kiro 官方模型（与 UI 保持一致）
@@ -1522,12 +1653,13 @@ export class ProxyServer {
       const account = this.accountPool.getNextAccount()
       if (account) {
         try {
-          kiroModels = await fetchKiroModels(account)
+          kiroModels = await fetchKiroModels(account, signal)
           if (kiroModels.length > 0) {
             this.modelCache = { models: kiroModels, timestamp: now }
             proxyLogger.info('ProxyServer', `Fetched ${kiroModels.length} models from Kiro API`)
           }
         } catch (error) {
+          if (this.isAbortError(error, signal)) throw error
           console.error('[ProxyServer] Failed to fetch Kiro models:', error)
         }
       }
@@ -1580,13 +1712,15 @@ export class ProxyServer {
       }
     }
 
+    this.throwIfResponseClosed(res, signal)
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({ object: 'list', data: allModels }))
   }
 
   // 处理 OpenAI Chat Completions 请求
-  private async handleOpenAIChat(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await this.readBody(req)
+  private async handleOpenAIChat(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    this.throwIfAborted(signal)
     const request: OpenAIChatRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
@@ -1600,8 +1734,9 @@ export class ProxyServer {
 
     let processedRequest: OpenAIChatRequest
     try {
-      processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(request))
+      processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(request), signal)
     } catch (error) {
+      if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Invalid request'
       this.sendError(res, 400, message)
@@ -1611,7 +1746,9 @@ export class ProxyServer {
     }
 
     // 获取账号（包含 Token 刷新检查）
-    const account = await this.getAvailableAccount()
+    this.throwIfAborted(signal)
+    const account = await this.getAvailableAccount(signal)
+    this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
       const quotaStatus = this.accountPool.getQuotaStatus()
@@ -1653,19 +1790,21 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry)
+        await this.handleOpenAIStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, matchedApiKey, toolNameRegistry, signal)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
             const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry)
-            return callKiroApi(acc, retryPayload)
+            return callKiroApi(acc, retryPayload, signal)
           },
-          '/v1/chat/completions'
+          '/v1/chat/completions',
+          signal
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
+        this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
@@ -1682,12 +1821,13 @@ export class ProxyServer {
         }
       }
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1/chat/completions', request.model, startTime)
+      this.handleApiError(res, account, error as Error, '/v1/chat/completions', request.model, startTime, signal)
     }
   }
 
-  private async handleOpenAIResponses(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await this.readBody(req)
+  private async handleOpenAIResponses(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    this.throwIfAborted(signal)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
     const startTime = Date.now()
 
@@ -1701,8 +1841,9 @@ export class ProxyServer {
       responseRequest = JSON.parse(body)
       chatRequest = responsesToOpenAIChat(responseRequest)
       chatRequest.model = this.applyModelMapping(chatRequest.model, matchedApiKey?.id)
-      processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(chatRequest))
+      processedRequest = await this.resolveOpenAIHttpImages(this.prepareOpenAIRequest(chatRequest), signal)
     } catch (error) {
+      if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Invalid request'
       this.sendError(res, 400, message)
@@ -1711,7 +1852,9 @@ export class ProxyServer {
       return
     }
 
-    const account = await this.getAvailableAccount()
+    this.throwIfAborted(signal)
+    const account = await this.getAvailableAccount(signal)
+    this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
       const quotaStatus = this.accountPool.getQuotaStatus()
@@ -1740,17 +1883,21 @@ export class ProxyServer {
           account,
           async (acc) => {
             const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry)
-            return callKiroApi(acc, retryPayload)
+            return callKiroApi(acc, retryPayload, signal)
           },
-          '/v1/responses'
+          '/v1/responses',
+          signal
         )
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
+        this.throwIfResponseClosed(res, signal)
         const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
         const streamedResponse = { ...response, id: responseId }
         streamedResponse.output.forEach((item, outputIndex) => {
+          this.throwIfResponseClosed(res, signal)
           res.write(`event: response.output_item.added\ndata: ${JSON.stringify({ type: 'response.output_item.added', output_index: outputIndex, item })}\n\n`)
           if (item.type === 'message') {
             item.content.forEach((part, contentIndex) => {
+              this.throwIfResponseClosed(res, signal)
               res.write(`event: response.content_part.added\ndata: ${JSON.stringify({ type: 'response.content_part.added', item_id: item.id, output_index: outputIndex, content_index: contentIndex, part: { type: part.type, text: '' } })}\n\n`)
               if (part.text) {
                 res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({ type: 'response.output_text.delta', item_id: item.id, output_index: outputIndex, content_index: contentIndex, delta: part.text })}\n\n`)
@@ -1764,8 +1911,10 @@ export class ProxyServer {
             }
             res.write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments })}\n\n`)
           }
+          this.throwIfResponseClosed(res, signal)
           res.write(`event: response.output_item.done\ndata: ${JSON.stringify({ type: 'response.output_item.done', output_index: outputIndex, item })}\n\n`)
         })
+        this.throwIfResponseClosed(res, signal)
         res.write(`event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: streamedResponse })}\n\n`)
         res.end()
         this.recordRequestSuccess()
@@ -1785,11 +1934,13 @@ export class ProxyServer {
         account,
         async (acc) => {
           const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry)
-          return callKiroApi(acc, retryPayload)
+          return callKiroApi(acc, retryPayload, signal)
         },
-        '/v1/responses'
+        '/v1/responses',
+        signal
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
+      this.throwIfResponseClosed(res, signal)
       const response = openAIChatToResponsesResponse(chatResponse, responseRequest.previous_response_id)
 
       this.recordRequestSuccess()
@@ -1806,7 +1957,7 @@ export class ProxyServer {
         this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, chatRequest.model, '/v1/responses')
       }
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime)
+      this.handleApiError(res, account, error as Error, '/v1/responses', chatRequest.model, startTime, signal)
     }
   }
 
@@ -1821,7 +1972,8 @@ export class ProxyServer {
     streamId?: string,
     headersSent: boolean = false,
     matchedApiKey?: import('./types').ApiKey,
-    toolNameRegistry: ToolNameRegistry = new ToolNameRegistry()
+    toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
+    signal?: AbortSignal
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -1846,6 +1998,7 @@ export class ProxyServer {
         account as any,
         kiroPayload,
         (text, toolUse, isThinking) => {
+          if (signal?.aborted || this.isResponseClosed(res)) return
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 reasoning_content
@@ -1881,6 +2034,10 @@ export class ProxyServer {
           }
         },
         async (usage) => {
+          if (signal?.aborted || this.isResponseClosed(res)) {
+            resolve()
+            return
+          }
           
           this.recordRequestSuccess()
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
@@ -1961,8 +2118,12 @@ export class ProxyServer {
 
             // 递归调用继续流式输出
             try {
-              await this.handleOpenAIStream(res, account, continuePayload, model, startTime, currentRound + 1, id, true, matchedApiKey, toolNameRegistry)
+              await this.handleOpenAIStream(res, account, continuePayload, model, startTime, currentRound + 1, id, true, matchedApiKey, toolNameRegistry, signal)
             } catch (error) {
+              if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+                resolve()
+                return
+              }
               console.error('[ProxyServer] Auto-continue error:', error)
             }
             resolve()
@@ -1996,6 +2157,10 @@ export class ProxyServer {
           }
         },
         (error) => {
+          if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+            resolve()
+            return
+          }
           console.error('[ProxyServer] Stream error:', error)
           res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
           res.end()
@@ -2007,15 +2172,23 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
-        undefined,
+        signal,
         this.config.preferredEndpoint
-      )
+      ).catch(error => {
+        if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
+          res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`)
+          res.end()
+          this.recordRequestFailed()
+        }
+        resolve()
+      })
     })
   }
 
   // 处理 Claude Messages 请求
-  private async handleClaudeMessages(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
-    const body = await this.readBody(req)
+  private async handleClaudeMessages(req: http.IncomingMessage, res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+    const body = await this.readBody(req, signal)
+    this.throwIfAborted(signal)
     const request: ClaudeRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
@@ -2029,8 +2202,9 @@ export class ProxyServer {
 
     let processedRequest: ClaudeRequest
     try {
-      processedRequest = await this.resolveClaudeHttpImages(this.prepareClaudeRequest(request))
+      processedRequest = await this.resolveClaudeHttpImages(this.prepareClaudeRequest(request), signal)
     } catch (error) {
+      if (this.isAbortError(error, signal)) return
       this.recordRequestFailed()
       const message = error instanceof Error ? error.message : 'Invalid request'
       this.sendError(res, 400, message, 'anthropic')
@@ -2040,7 +2214,9 @@ export class ProxyServer {
     }
 
     // 获取账号（包含 Token 刷新检查）
-    const account = await this.getAvailableAccount()
+    this.throwIfAborted(signal)
+    const account = await this.getAvailableAccount(signal)
+    this.throwIfAborted(signal)
     if (!account) {
       this.recordRequestFailed()
       const quotaStatus = this.accountPool.getQuotaStatus()
@@ -2081,19 +2257,21 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry)
+        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
             const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry)
-            return callKiroApi(acc, retryPayload)
+            return callKiroApi(acc, retryPayload, signal)
           },
-          '/v1/messages'
+          '/v1/messages',
+          signal
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
+        this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
         this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
         this.stats.inputTokens += result.usage.inputTokens
@@ -2106,7 +2284,7 @@ export class ProxyServer {
         this.recordRequest({ path: '/v1/messages', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, responseTime: Date.now() - startTime, success: true })
       }
     } catch (error) {
-      this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime)
+      this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)
     }
   }
 
@@ -2122,7 +2300,8 @@ export class ProxyServer {
     headersSent: boolean = false,
     contentBlockIndex: number = 0,
     matchedApiKey?: import('./types').ApiKey,
-    toolNameRegistry: ToolNameRegistry = new ToolNameRegistry()
+    toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
+    signal?: AbortSignal
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -2175,6 +2354,7 @@ export class ProxyServer {
         account as any,
         kiroPayload,
         (text, toolUse, isThinking, reasoningSignature) => {
+          if (signal?.aborted || this.isResponseClosed(res)) return
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 Anthropic thinking block
@@ -2272,6 +2452,10 @@ export class ProxyServer {
           }
         },
         async (usage) => {
+          if (signal?.aborted || this.isResponseClosed(res)) {
+            resolve()
+            return
+          }
           if (hasStartedThinkingBlock) {
             flushThinkingSignature()
             const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
@@ -2354,8 +2538,12 @@ export class ProxyServer {
             } as typeof kiroPayload
 
             try {
-              await this.handleClaudeStream(res, account, continuePayload, model, startTime, currentRound + 1, id, true, currentBlockIndex, matchedApiKey, toolNameRegistry)
+              await this.handleClaudeStream(res, account, continuePayload, model, startTime, currentRound + 1, id, true, currentBlockIndex, matchedApiKey, toolNameRegistry, signal)
             } catch (error) {
+              if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+                resolve()
+                return
+              }
               console.error('[ProxyServer] Claude auto-continue error:', error)
             }
             resolve()
@@ -2375,6 +2563,10 @@ export class ProxyServer {
           }
         },
         (error) => {
+          if (this.isAbortError(error, signal) || this.isResponseClosed(res)) {
+            resolve()
+            return
+          }
           console.error('[ProxyServer] Stream error:', error)
           const errorEvent = createClaudeStreamEvent('error', {
             error: { type: 'api_error', message: error.message }
@@ -2389,14 +2581,25 @@ export class ProxyServer {
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
         },
-        undefined,
+        signal,
         this.config.preferredEndpoint
-      )
+      ).catch(error => {
+        if (!this.isAbortError(error, signal) && !this.isResponseClosed(res)) {
+          const errorEvent = createClaudeStreamEvent('error', {
+            error: { type: 'api_error', message: error.message }
+          })
+          res.write(`event: error\ndata: ${JSON.stringify(errorEvent)}\n\n`)
+          res.end()
+          this.recordRequestFailed()
+        }
+        resolve()
+      })
     })
   }
 
   // 处理 API 错误
-  private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number): void {
+  private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
+    if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
     const errCode = error.message.match(/(\d{3})/)?.[1]
     const parsedCode = errCode ? parseInt(errCode) : 500
@@ -2409,7 +2612,7 @@ export class ProxyServer {
     if (isAuthError) statusCode = 401
 
     if (res.headersSent) {
-      if (!res.writableEnded) {
+      if (!this.isResponseClosed(res)) {
         if (path === '/v1/responses' || path === '/responses') {
           res.write(`event: response.failed\ndata: ${JSON.stringify({ type: 'response.failed', error: { type: 'api_error', message: error.message } })}\n\n`)
         }
@@ -2426,17 +2629,48 @@ export class ProxyServer {
   }
 
   // 读取请求体
-  private readBody(req: http.IncomingMessage): Promise<string> {
+  private readBody(req: http.IncomingMessage, signal?: AbortSignal): Promise<string> {
     return new Promise((resolve, reject) => {
       let body = ''
-      req.on('data', chunk => body += chunk)
-      req.on('end', () => resolve(body))
-      req.on('error', reject)
+      const cleanup = () => {
+        req.off('data', onData)
+        req.off('end', onEnd)
+        req.off('error', onError)
+        req.off('aborted', onAborted)
+        signal?.removeEventListener('abort', onAbort)
+      }
+      const onData = (chunk: Buffer) => body += chunk
+      const onEnd = () => {
+        cleanup()
+        resolve(body)
+      }
+      const onError = (error: Error) => {
+        cleanup()
+        reject(error)
+      }
+      const onAborted = () => {
+        cleanup()
+        reject(new Error('Client disconnected'))
+      }
+      const onAbort = () => {
+        cleanup()
+        reject(this.getAbortError(signal))
+      }
+      if (signal?.aborted) {
+        reject(this.getAbortError(signal))
+        return
+      }
+      req.on('data', onData)
+      req.on('end', onEnd)
+      req.on('error', onError)
+      req.on('aborted', onAborted)
+      signal?.addEventListener('abort', onAbort, { once: true })
     })
   }
 
   // 发送错误响应
   private sendError(res: http.ServerResponse, status: number, message: string, format: 'openai' | 'anthropic' = 'openai'): void {
+    if (res.writableEnded || res.destroyed) return
     res.writeHead(status, { 'Content-Type': 'application/json' })
     if (format === 'anthropic') {
       res.end(JSON.stringify({

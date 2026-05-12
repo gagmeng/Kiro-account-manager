@@ -33,6 +33,29 @@ function generateRandomMachineId(): string {
 let tokenRefreshTimer: ReturnType<typeof setInterval> | null = null
 const TOKEN_REFRESH_BEFORE_EXPIRY = 5 * 60 * 1000 // 过期前 5 分钟刷新
 
+function isBannedAccountError(error?: string): boolean {
+  if (!error) return false
+  const lowerError = error.toLowerCase()
+  const hasSuspendedSignal =
+    lowerError.includes('accountsuspendedexception') ||
+    lowerError.includes('account suspended') ||
+    lowerError.includes('账户已封禁') ||
+    lowerError.includes('已封禁') ||
+    /\b423\b/.test(lowerError)
+  if (hasSuspendedSignal) return true
+  if (
+    lowerError.includes('fetch failed') ||
+    lowerError.includes('network') ||
+    lowerError.includes('token expired') ||
+    lowerError.includes('token 过期') ||
+    lowerError.includes('刷新失败') ||
+    lowerError.includes('unauthorizedexception')
+  ) {
+    return false
+  }
+  return false
+}
+
 // 自动换号定时器
 let autoSwitchTimer: ReturnType<typeof setInterval> | null = null
 
@@ -686,10 +709,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 封禁筛选
     if (filter.bannedOnly) {
-      result = result.filter((a) => 
-        a.lastError?.includes('UnauthorizedException') || 
-        a.lastError?.includes('AccountSuspendedException')
-      )
+      result = result.filter((a) => isBannedAccountError(a.lastError))
     }
 
     // 应用排序
@@ -1259,8 +1279,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         stats.expiringSoonCount++
       }
       // 统计封禁账号
-      if (account.lastError?.includes('UnauthorizedException') || 
-          account.lastError?.includes('AccountSuspendedException')) {
+      if (isBannedAccountError(account.lastError)) {
         stats.bannedCount++
       }
     }
@@ -1737,8 +1756,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // 排除当前账号
         if (acc.id === activeAccount.id) return false
         // 排除被封禁的账号
-        if (acc.lastError?.includes('UnauthorizedException') || 
-            acc.lastError?.includes('AccountSuspendedException')) return false
+        if (isBannedAccountError(acc.lastError)) return false
         // 排除余额不足的账号
         const accRemaining = acc.usage.limit - acc.usage.current
         if (accRemaining <= autoSwitchThreshold) return false
@@ -1793,8 +1811,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     
     for (const [id, account] of accounts) {
       // 跳过已封禁或错误状态的账号
-      if (account.lastError?.includes('UnauthorizedException') || 
-          account.lastError?.includes('AccountSuspendedException')) {
+      if (isBannedAccountError(account.lastError)) {
         console.log(`[AutoRefresh] Skipping ${account.email} (banned/error)`)
         continue
       }
@@ -1860,8 +1877,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     
     for (const [id, account] of accounts) {
       // 跳过已封禁或错误状态的账号
-      if (account.lastError?.includes('UnauthorizedException') || 
-          account.lastError?.includes('AccountSuspendedException')) {
+      if (isBannedAccountError(account.lastError)) {
         continue
       }
 
@@ -1962,8 +1978,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     
     for (const [id, account] of accounts) {
       // 跳过已封禁或错误状态的账号
-      if (account.lastError?.includes('UnauthorizedException') || 
-          account.lastError?.includes('AccountSuspendedException')) {
+      if (isBannedAccountError(account.lastError)) {
         continue
       }
 
