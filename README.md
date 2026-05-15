@@ -271,6 +271,104 @@ The project is configured with GitHub Actions workflow for auto building all pla
 
 ## 📋 Changelog
 
+
+### v1.6.5 (2026-5-15)
+
+#### Prompt Cache Simulator
+- **New**: Full prompt cache simulation — tracks `cache_control` breakpoints, calculates `cache_read_input_tokens` and `cache_creation_input_tokens` per account, returns realistic cache usage in API responses
+- **New**: Cache hit rate displayed in proxy dashboard with percentage badge
+- **New**: Three-tier detection: tools → system → message blocks, supports `ephemeral` TTL (5min/1h)
+
+#### Frontend Dashboard Enhancement
+- **New**: Second row of stats cards — Total Tokens, Input/Output, Cache Hit %, Reasoning Tokens, Success Rate, Credits
+- **New**: Large numbers auto-compact (e.g. `206.3M`, `1096K`) with hover tooltip for full value
+- **New**: Log table columns added — Cache Read (green), Response Time
+- **New**: System Logs page in sidebar — full console output with virtual scrolling, level filter, search, auto-follow
+
+#### System Logs Page
+- **New**: Dedicated logs page showing ALL system output (proxy, API, accounts, background tasks)
+- **New**: Console interceptor captures `console.log/warn/error` into log store
+- **New**: Virtual scrolling (`@tanstack/react-virtual`) — handles 100K+ entries without lag
+- **New**: Smart auto-scroll — follows at bottom, pauses on scroll up, floating "Back to bottom" button with new log count
+- **New**: Level filter pills (ALL/DEBUG/INFO/WARN/ERROR) with colored counts
+- **New**: Grid-aligned columns, category color coding (Kiro=blue, ProxyServer=violet, KiroAPI=cyan)
+- **New**: Click to expand data details (JSON formatted), stream events aggregated into summary
+
+#### Log Optimization
+- **Improved**: All API logs (CBOR/REST) now show account email for easy identification
+- **Improved**: API response logs split into one-line summary + expandable JSON data (click ⓘ to view)
+- **Improved**: Removed token plaintext from logs (security), replaced with `token=Nchars` length indicator
+- **Improved**: Redundant multi-line logs consolidated — `[IPC]`, `[Kiro API]`, `[Kiro REST API]` each reduced to 1 line per request/response
+- **Improved**: `[KiroPayload]` and `[KiroAPI] Request to` keep structured data in expandable details
+- **Removed**: `[REST->Unified] Converting response` duplicate log, `Using K-Proxy agent` noise logs
+
+#### Log Viewer Enhancements
+- **Improved**: Proxy Detailed Logs dialog — replaced pagination with virtual scrolling + smart auto-follow + "Back to bottom" floating button
+- **Improved**: System Logs page — added time range filter (1h/6h/1d/7d), category dropdown, display limit selector (5K–100K)
+- **Improved**: System Logs fetch count now follows user-selected display limit instead of hardcoded 3000
+- **Improved**: Both log pages share consistent UX: scroll-up pauses follow, bottom indicator, new log count badge
+
+#### Advanced Configuration
+- **New**: Payload size limit configurable in Advanced Settings (256KB–10240KB, default 1536KB/1.5MB)
+- **Changed**: Payload truncation threshold raised from 380KB to 1.5MB — supports 200K+ token context models without premature truncation
+- **Changed**: Tool result truncation length increased from 2000 to 4000 chars when limit is reached
+
+#### Bug Fixes
+- **Fixed**: `tool_result content block N requires text` — empty/null tool results now normalized to `"(no output)"` instead of throwing 400
+- **Fixed**: Thinking parameter sent to non-Claude models causing 400 — now only sent to Claude 4+ models via `modelSupportsThinkingParam()`
+- **Fixed**: Stream event logs flooding — aggregated into single summary per request when `logStreamEvents` enabled
+- **New**: Hidden model IDs added to model list — `simple-task`, `CLAUDE_SONNET_4_20250514_V1_0`, `CLAUDE_HAIKU_4_5_20251001_V1_0`, `CLAUDE_3_7_SONNET_20250219_V1_0`
+
+### v1.6.4 (2026-5-14)
+
+#### API Proxy
+- **Fixed**: Claude Code `thinking` parameter no longer causes `400 REQUEST_BODY_INVALID` — all thinking requests mapped to Kiro enum `{ type: "adaptive" }` (Kiro schema only accepts `["adaptive", "disabled"]`)
+- **Fixed**: `context_management`, `effort`, `anthropic_beta` no longer injected into `additionalModelRequestFields` — Kiro schema does not allow additional properties, only `thinking` is permitted
+- **Fixed**: System prompt no longer embedded as `--- SYSTEM PROMPT ---` text in user messages (detected as prompt injection by Claude models) — now uses Kiro official Human/AI pair injection matching the official IDE behavior
+- **Fixed**: CodeWhisperer model ID resolution no longer incorrectly maps `claude-opus-4.7` to a Sonnet model — matching uses model family exclusion (opus/sonnet/haiku) to prevent cross-family mismatches
+- **Fixed**: Model matching no longer searches description text, reducing false positives for new models not yet in `ListAvailableModels`
+- **Fixed**: Token estimation corrected — input (JSON payload) uses 0.3 token/char, output (natural language) uses 0.4 token/char with CJK-aware `estimateTokens()` helper
+- **Changed**: AmazonQ CLI endpoint origin updated to `SM_AI_STUDIO_IDE`
+
+#### Session Stability & Anti-Ban
+- **New**: `conversationId` stabilization — same client session reuses the same `conversationId` across multi-turn requests (matches official Kiro IDE behavior)
+- **New**: Three-tier session detection: HTTP headers (`X-Claude-Code-Session-Id`, `x-opencode-session`, `x-session-affinity`) → body fields (`conversation_id`, `thread_id`, `session_id`) → history fingerprint fallback
+- **New**: API Key isolation — different API keys automatically get separate conversation namespaces
+- **New**: `/admin/cache/clear` endpoint — manually clear conversationId and model cache
+
+#### Claude Code Compatibility
+- **New**: `redacted_thinking` block support — Kiro's `ReasoningContentEvent.redactedContent` decoded and converted to Anthropic `redacted_thinking` content blocks (request input and response output)
+- **New**: Payload size limiter — when payload exceeds 380KB, oldest large tool results are truncated to 2000 chars with marker; prevents Kiro API rejection on long conversations
+- **New**: OpenAI-compatible `thinking` parameter also mapped to Kiro `additionalModelRequestFields`
+
+### v1.6.2 (2026-5-13)
+
+#### Account Switching
+- **Fixed**: Switching to Google/GitHub social login accounts no longer causes `Invalid token` error in Kiro IDE
+- **Fixed**: Token is now refreshed before writing to `kiro-auth-token.json`, ensuring Kiro IDE always gets a valid `accessToken`
+- **Fixed**: `profileArn` is now always included in the token file, auto-derived from provider when not stored (Google/GitHub → social profile, BuilderId → builder profile)
+- **Fixed**: Social login token file format now exactly matches official Kiro IDE output (no extra `region` or `clientIdHash` fields)
+- **Fixed**: Kiro CLI switch also refreshes token before writing, includes `profileArn`, and correctly identifies social vs IdC login
+- **Fixed**: CLI `isSocial` detection no longer incorrectly classifies BuilderId as social login
+
+#### Client Configuration
+- **Fixed**: One-click client configuration now loads models from proxy service first (consistent with "View Models" dialog), falls back to direct account query only when proxy is not running
+- **Fixed**: Claude Code configuration now writes `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, and `ANTHROPIC_DEFAULT_SONNET_MODEL` fields, matching the full official config format
+- **Fixed**: Hidden models (e.g., `claude-3.7-sonnet`) now appear in one-click client configuration model list
+
+#### Proxy & Network
+- **New**: System proxy auto-detection — Windows (registry `Internet Settings`) and macOS (`scutil --proxy`) with 30s cache
+- **Fixed**: All outbound connections now follow unified proxy priority: user-configured proxy → system proxy → direct
+- **Fixed**: Registration module (MoEmail, TempMail.Plus, Outlook OAuth, TLS client) no longer uses a separate proxy input; follows global proxy settings automatically
+- **Fixed**: Image download in proxy server also falls back to system proxy
+
+#### Registration
+- **New**: Auto-fetch Kiro Pro subscription link after registration — toggle in registration page, results displayed in Subscription page "Links" tab
+- **Improved**: Concurrent registration log isolation — each batch task prefixed with `[#taskId]` to prevent log mixing
+- **Improved**: Registration log events now carry structured `{ message, taskId }` for better filtering
+- **Fixed**: `refreshAppJSConfig` uses Promise lock to prevent concurrent workers from racing on app.js download
+- **Removed**: Per-registration proxy input field (now uses global proxy settings)
+
 ### v1.6.1 (2026-5-12)
 
 #### API Proxy Compatibility

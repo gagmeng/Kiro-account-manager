@@ -16,8 +16,9 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents } from './proxy/kiroApi'
-import { proxyLogStore } from './proxy/logger'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB } from './proxy/kiroApi'
+import { getSystemProxy } from './proxy/systemProxy'
+import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import {
   createTray,
@@ -141,7 +142,7 @@ export function getUseKProxyForApi(): boolean {
   return useKProxyForApi
 }
 
-// 获取网络代理 agent（优先 K-Proxy，其次环境变量代理）
+// 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
 function getNetworkAgent(): ProxyAgent | undefined {
   if (useKProxyForApi) {
     const kproxyService = getKProxyService()
@@ -154,6 +155,10 @@ function getNetworkAgent(): ProxyAgent | undefined {
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
   if (envProxy) {
     return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
+  }
+  const systemProxy = getSystemProxy()
+  if (systemProxy) {
+    return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
   }
   return undefined
 }
@@ -240,7 +245,7 @@ let proxyServer: ProxyServer | null = null
 function initProxyServer(): ProxyServer {
   if (proxyServer) return proxyServer
 
-  // 初始化日志存储
+  // 确保日志存储已初始化（app.whenReady 中已调用，此处兜底）
   proxyLogStore.initialize(app.getPath('userData'))
 
   // 从 store 加载保存的配置，如果没有则使用默认配置
@@ -280,6 +285,11 @@ function initProxyServer(): ProxyServer {
   
   // 合并保存的配置和默认配置
   const config: ProxyConfig = savedConfig ? { ...defaultConfig, ...savedConfig } : defaultConfig
+
+  // 恢复 payload 大小限制
+  if (config.payloadSizeLimitKB) {
+    setPayloadSizeLimitKB(config.payloadSizeLimitKB)
+  }
 
   proxyServer = new ProxyServer(
     config,
@@ -829,18 +839,13 @@ async function kiroApiRequest<T>(
   body: Record<string, unknown>,
   accessToken: string,
   idp: string = 'BuilderId',  // 支持 BuilderId, Github, Google
-  accountMachineId?: string   // 账户绑定的设备 ID
+  accountMachineId?: string,  // 账户绑定的设备 ID
+  email?: string              // 用于日志标识
 ): Promise<T> {
-  console.log(`[Kiro API] Calling ${operation}`)
-  console.log(`[Kiro API] Body:`, JSON.stringify(body))
-  console.log(`[Kiro API] AccessToken length:`, accessToken?.length)
-  console.log(`[Kiro API] AccessToken (first 100 chars):`, accessToken?.substring(0, 100))
-  console.log(`[Kiro API] AccessToken (last 50 chars):`, accessToken?.substring(accessToken.length - 50))
-  console.log(`[Kiro API] Idp:`, idp)
-
   // 优先使用账户绑定的设备 ID，其次使用 K-Proxy 全局设备 ID
   const machineId = accountMachineId || getCurrentMachineId()
-  console.log(`[Kiro API] Machine ID: ${machineId || 'undefined'} (account: ${accountMachineId ? 'yes' : 'no'})`)
+  const logTag = email || `token:${accessToken?.slice(-6) || '?'}`
+  console.log(`[Kiro API] ${operation} [${logTag}] ${idp} machineId=${machineId?.slice(0, 8) || 'none'}`)
   const agent = getKProxyAgent()
   
   // 使用 undici fetch 支持代理
@@ -857,7 +862,6 @@ async function kiroApiRequest<T>(
   
   let response: Response
   if (agent) {
-    console.log('[Kiro API] Using K-Proxy agent')
     response = await undiciFetch(`${KIRO_API_BASE}/${operation}`, {
       method: 'POST',
       headers,
@@ -871,8 +875,6 @@ async function kiroApiRequest<T>(
       body: Buffer.from(encode(body))
     })
   }
-
-  console.log(`[Kiro API] Response status: ${response.status}`)
 
   if (!response.ok) {
     // 尝试解析 CBOR 格式的错误响应
@@ -899,7 +901,10 @@ async function kiroApiRequest<T>(
 
   const arrayBuffer = await response.arrayBuffer()
   const result = decode(Buffer.from(arrayBuffer)) as T
-  console.log(`[Kiro API] Response:`, JSON.stringify(result, null, 2))
+  // 精简响应日志：一行摘要 + 完整数据放 data（ⓘ 展开）
+  const r = result as Record<string, unknown>
+  const resSummary = r.email ? `${r.email} [${r.status || 'ok'}]` : `${response.status}`
+  console.log(`[Kiro API] ${operation} [${logTag}] → ${resSummary}`, result)
   return result
 }
 
@@ -999,7 +1004,6 @@ async function fetchRestApi(
   }
   const url = `${baseUrl}${path}`
   if (agent) {
-    console.log('[Kiro REST API] Using K-Proxy agent')
     return await undiciFetch(url, {
       method: 'GET',
       headers,
@@ -1013,13 +1017,13 @@ async function getUsageLimitsRest(
   accessToken: string,
   profileArn?: string,
   accountMachineId?: string,  // 账户绑定的设备 ID
-  ssoRegion?: string          // SSO 区域，用于选择正确的 REST API 端点
+  ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
+  email?: string              // 用于日志标识
 ): Promise<UsageLimitsResponse> {
-  console.log(`[Kiro REST API] Calling GetUsageLimits (ssoRegion: ${ssoRegion || 'default'})`)
-  
   // 优先使用账户绑定的设备 ID，其次使用 K-Proxy 全局设备 ID
   const machineId = accountMachineId || getCurrentMachineId()
-  console.log(`[Kiro REST API] Machine ID: ${machineId || 'undefined'} (account: ${accountMachineId ? 'yes' : 'no'})`)
+  const logTag = email || `token:${accessToken?.slice(-6) || '?'}`
+  console.log(`[Kiro REST API] GetUsageLimits [${logTag}] region=${ssoRegion || 'default'}`)
   
   const params = new URLSearchParams({
     origin: 'AI_EDITOR',
@@ -1035,26 +1039,22 @@ async function getUsageLimitsRest(
   const primaryBase = getRestApiBase(ssoRegion)
   const fallbackBase = getFallbackRestApiBase(ssoRegion)
   
-  console.log(`[Kiro REST API] Primary endpoint: ${primaryBase}`)
-  
   let response = await fetchRestApi(primaryBase, path, accessToken, machineId)
-  console.log(`[Kiro REST API] Response status: ${response.status}`)
   
   // 如果主端点返回 403，尝试备用端点
   if (response.status === 403) {
-    console.log(`[Kiro REST API] Primary endpoint returned 403, trying fallback: ${fallbackBase}`)
+    console.log(`[Kiro REST API] Primary 403, fallback → ${fallbackBase}`)
     response = await fetchRestApi(fallbackBase, path, accessToken, machineId)
-    console.log(`[Kiro REST API] Fallback response status: ${response.status}`)
   }
   
   if (!response.ok) {
     const errorText = await response.text()
-    console.error(`[Kiro REST API] Error: ${errorText}`)
+    console.error(`[Kiro REST API] GetUsageLimits failed: ${response.status}`, errorText)
     throw new Error(`HTTP ${response.status}: ${errorText}`)
   }
   
   const result = await response.json()
-  console.log(`[Kiro REST API] Response:`, JSON.stringify(result, null, 2))
+  console.log(`[Kiro REST API] GetUsageLimits [${logTag}] → ${response.status}`, result)
   return result
 }
 
@@ -1118,12 +1118,12 @@ async function getUsageAndLimits(
   idp: string = 'BuilderId',
   profileArn?: string,
   accountMachineId?: string,  // 账户绑定的设备 ID
-  ssoRegion?: string          // SSO 区域，用于选择正确的 REST API 端点
+  ssoRegion?: string,         // SSO 区域，用于选择正确的 REST API 端点
+  email?: string              // 用于日志标识
 ): Promise<UnifiedUsageResponse> {
   if (currentUsageApiType === 'rest') {
     // 使用 REST API (GetUsageLimits)
-    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion)
-    console.log('[REST->Unified] Converting response:', JSON.stringify(result, null, 2))
+    const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
     // REST API 返回的字段名和 CBOR API 相同，直接返回
     return {
       usageBreakdownList: result.usageBreakdownList?.map(b => ({
@@ -1182,14 +1182,15 @@ async function getUsageAndLimits(
         { isEmailRequired: true, origin: 'KIRO_IDE' },
         accessToken,
         idp,
-        accountMachineId
+        accountMachineId,
+        email
       )
     } catch (cborError) {
       const errorMsg = cborError instanceof Error ? cborError.message : ''
       // CBOR 401/403 时自动 fallback 到 REST API
       if (errorMsg.includes('401') || errorMsg.includes('403')) {
         console.log(`[API] CBOR API failed (${errorMsg}), falling back to REST API...`)
-        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion)
+        const result = await getUsageLimitsRest(accessToken, profileArn, accountMachineId, ssoRegion, email)
         return {
           usageBreakdownList: result.usageBreakdownList?.map(b => ({
             resourceType: b.resourceType || b.type,
@@ -1248,8 +1249,8 @@ interface UserInfoResponse {
   featureFlags?: string[]
 }
 
-async function getUserInfo(accessToken: string, idp: string = 'BuilderId', accountMachineId?: string): Promise<UserInfoResponse> {
-  return kiroApiRequest<UserInfoResponse>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp, accountMachineId)
+async function getUserInfo(accessToken: string, idp: string = 'BuilderId', accountMachineId?: string, email?: string): Promise<UserInfoResponse> {
+  return kiroApiRequest<UserInfoResponse>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp, accountMachineId, email)
 }
 
 // 定义自定义协议
@@ -1710,6 +1711,10 @@ function handleProtocolUrl(url: string): void {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
+  proxyLogStore.initialize(app.getPath('userData'))
+  interceptConsole()
+
   // 注册自定义协议
   registerProtocol()
 
@@ -2197,9 +2202,7 @@ app.whenReady().then(async () => {
 
   // IPC: 检查账号状态（支持自动刷新 Token）
   ipcMain.handle('check-account-status', async (_event, account) => {
-    console.log('[IPC] check-account-status called')
-    console.log('[IPC] Account email:', account?.email)
-    console.log('[IPC] Has credentials:', !!account?.credentials)
+    console.log(`[IPC] check-account-status [${account?.email || 'unknown'}]`)
 
     interface Bonus {
       bonusCode?: string
@@ -2270,7 +2273,7 @@ app.whenReady().then(async () => {
       refreshToken?: string
       expiresIn?: number
     }, userInfo?: UserInfoResponse) => {
-      console.log('GetUserUsageAndLimits response:', JSON.stringify(result, null, 2))
+      console.log(`[Kiro API] Usage [${account?.email || userInfo?.email || 'unknown'}]`, result)
 
       // 解析 Credits 使用量（resourceType 为 CREDIT）
       const creditUsage = result.usageBreakdownList?.find(
@@ -2410,20 +2413,19 @@ app.whenReady().then(async () => {
 
       // 获取账户绑定的设备 ID
       const accountMachineId = account?.machineId as string | undefined
-      console.log(`[IPC] Account Machine ID: ${accountMachineId || 'not set'}`)
 
       // 第一次尝试：使用当前 accessToken
       try {
         // 并行调用 GetUserInfo 和 getUsageAndLimits
         const [userInfoResult, usageResult] = await Promise.all([
-          getUserInfo(accessToken, idp, accountMachineId).catch((err: Error) => {
+          getUserInfo(accessToken, idp, accountMachineId, account?.email).catch((err: Error) => {
             // 封禁错误不能吞掉，必须向上抛出
             if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
               throw err
             }
             return undefined
           }),
-          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region)
+          getUsageAndLimits(accessToken, idp, undefined, accountMachineId, region, account?.email)
         ])
         return parseUsageResponse(usageResult, undefined, userInfoResult)
       } catch (apiError) {
@@ -2856,7 +2858,7 @@ app.whenReady().then(async () => {
 
             // 调用 API 获取用量和用户信息（根据配置选择 REST 或 CBOR 格式）
             const [usageRes, userInfoRes] = await Promise.allSettled([
-              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region) as Promise<{
+              getUsageAndLimits(accessToken, idp, undefined, undefined, account.credentials?.region, account.email) as Promise<{
                 usageBreakdownList?: Array<{
                   resourceType?: string
                   displayName?: string
@@ -2906,7 +2908,7 @@ app.whenReady().then(async () => {
                 userId?: string
                 status?: string
                 idp?: string
-              }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp).catch((err: Error) => {
+              }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp, undefined, account.email).catch((err: Error) => {
                 // 封禁错误不能吞掉，需要在后续逻辑中检测
                 if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
                   throw err
@@ -3533,6 +3535,7 @@ app.whenReady().then(async () => {
     startUrl?: string
     authMethod?: 'IdC' | 'social'
     provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
+    profileArn?: string
   }) => {
     const os = await import('os')
     const path = await import('path')
@@ -3541,15 +3544,29 @@ app.whenReady().then(async () => {
     
     try {
       const { 
-        accessToken, 
         refreshToken, 
         clientId, 
         clientSecret, 
         region = 'us-east-1',
         startUrl,
         authMethod = 'IdC',
-        provider = 'BuilderId'
+        provider = 'BuilderId',
+        profileArn
       } = credentials
+      let { accessToken } = credentials
+
+      // 切号前先刷新 token，确保写入的 accessToken 是最新的
+      // Kiro IDE 会直接使用 accessToken（不过期就不刷新），旧 token 会导致 Invalid token
+      if (refreshToken) {
+        console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
+        const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
+        if (refreshResult.success && refreshResult.accessToken) {
+          accessToken = refreshResult.accessToken
+          console.log('[Switch Account] Token refreshed successfully')
+        } else {
+          console.warn(`[Switch Account] Token refresh failed: ${refreshResult.error}, using existing token`)
+        }
+      }
       
       // 计算 clientIdHash (与 Kiro 客户端一致)
       // Enterprise 账户使用自己的 startUrl，BuilderId 使用默认的
@@ -3562,17 +3579,35 @@ app.whenReady().then(async () => {
       const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
       await mkdir(ssoCache, { recursive: true })
       
-      // 写入 token 文件
+      // 根据 provider 推导 profileArn（官方固定规则）
+      const SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+      const BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
+      const resolvedProfileArn = profileArn
+        || (authMethod === 'social' || provider === 'Google' || provider === 'Github' ? SOCIAL_PROFILE_ARN : BUILDER_ID_PROFILE_ARN)
+
+      // 写入 token 文件（格式与官方 Kiro IDE 完全一致）
       const tokenPath = path.join(ssoCache, 'kiro-auth-token.json')
-      const tokenData = {
-        accessToken,
-        refreshToken,
-        expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
-        clientIdHash,
-        authMethod,
-        provider,
-        region
-      }
+      const tokenData: Record<string, unknown> = authMethod === 'social'
+        ? {
+            // Social 登录格式：accessToken, refreshToken, profileArn, expiresAt, authMethod, provider
+            accessToken,
+            refreshToken,
+            profileArn: resolvedProfileArn,
+            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            authMethod,
+            provider
+          }
+        : {
+            // IdC 登录格式：accessToken, refreshToken, expiresAt, clientIdHash, authMethod, provider, region
+            accessToken,
+            refreshToken,
+            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+            clientIdHash,
+            authMethod,
+            provider,
+            region,
+            profileArn: resolvedProfileArn
+          }
       await writeFile(tokenPath, JSON.stringify(tokenData, null, 2))
       console.log('[Switch Account] Token saved to:', tokenPath)
       
@@ -3621,7 +3656,6 @@ app.whenReady().then(async () => {
 
     try {
       const {
-        accessToken,
         refreshToken,
         clientId,
         clientSecret,
@@ -3630,6 +3664,20 @@ app.whenReady().then(async () => {
         provider,
         scopes
       } = credentials
+      let { accessToken } = credentials
+
+      // 切号前先刷新 token（和 IDE 切号一致）
+      if (refreshToken) {
+        const authMethod = (provider === 'Google' || provider === 'Github') ? 'social' : undefined
+        console.log(`[Switch CLI] Refreshing token before switch (provider: ${provider})...`)
+        const refreshResult = await refreshTokenByMethod(refreshToken, clientId || '', clientSecret || '', region, authMethod)
+        if (refreshResult.success && refreshResult.accessToken) {
+          accessToken = refreshResult.accessToken
+          console.log('[Switch CLI] Token refreshed successfully')
+        } else {
+          console.warn(`[Switch CLI] Token refresh failed: ${refreshResult.error}, using existing token`)
+        }
+      }
 
       // kiro-cli SQLite 数据库路径
       // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
@@ -3641,9 +3689,14 @@ app.whenReady().then(async () => {
       const dbPath = path.join(dataDir, 'data.sqlite3')
 
       // 判断 token key：social 登录用 social:token，IdC 登录用 odic:token
-      const isSocial = !clientId || !clientSecret || provider === 'BuilderId' || provider === 'Google' || provider === 'Github'
+      const isSocial = provider === 'Google' || provider === 'Github'
       const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
       const preferredRegKey = 'kirocli:odic:device-registration'
+
+      // 根据 provider 推导 profileArn
+      const SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+      const BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
+      const resolvedProfileArn = profileArn || (isSocial ? SOCIAL_PROFILE_ARN : BUILDER_ID_PROFILE_ARN)
 
       // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
       const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString()
@@ -3651,9 +3704,9 @@ app.whenReady().then(async () => {
         access_token: accessToken,
         refresh_token: refreshToken,
         expires_at: expiresAt,
-        region
+        region,
+        profile_arn: resolvedProfileArn
       }
-      if (profileArn) tokenData.profile_arn = profileArn
       if (scopes) tokenData.scopes = scopes
 
       // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
@@ -4875,6 +4928,10 @@ app.whenReady().then(async () => {
       // 同步流式日志开关
       if (config.logStreamEvents !== undefined) {
         setLogStreamEvents(config.logStreamEvents)
+      }
+      // 同步 payload 大小限制
+      if (config.payloadSizeLimitKB !== undefined) {
+        setPayloadSizeLimitKB(config.payloadSizeLimitKB)
       }
       // 保存配置到 store（用于自启动）
       if (store) {

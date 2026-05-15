@@ -31,11 +31,12 @@ import {
   openAIChatToResponsesResponse
 } from './translator'
 import { ToolNameRegistry } from './toolNameRegistry'
+import { promptCacheTracker } from './promptCacheTracker'
 
 
 export interface ProxyServerEvents {
   onRequest?: (info: { path: string; method: string; accountId?: string }) => void
-  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; credits?: number; error?: string }) => void
+  onResponse?: (info: { path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }) => void
   onError?: (error: Error) => void
   onConfigChanged?: (config: ProxyConfig) => void  // API Key 用量更新时触发
   onStatusChange?: (running: boolean, port: number) => void
@@ -243,6 +244,48 @@ export class ProxyServer {
   private activeRequests: Set<AbortController> = new Set()
   private sockets: Set<Socket> = new Set()
 
+  /**
+   * 从请求中提取 session hint，用于稳定 conversationId
+   * 优先级 1：显式稳定 ID（header）
+   * 优先级 2：请求体中的会话相关字段（body）
+   * 优先级 3：返回 undefined（由 kiroApi 用 history fingerprint 兜底）
+   */
+  static extractSessionHint(req: http.IncomingMessage, body: unknown): string | undefined {
+    const b = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>
+    const h = req.headers
+    // 优先级 1：显式稳定 header
+    const headerHint =
+      (h['x-claude-code-session-id'] as string) ||
+      (h['x-opencode-session'] as string) ||
+      (h['x-session-affinity'] as string) ||
+      (h['x-conversation-id'] as string)
+    if (headerHint) return headerHint
+
+    // 优先级 2：body 中可靠的会话字段
+    const bodyHint =
+      (b.prompt_cache_key as string) ||
+      (b.promptCacheKey as string) ||
+      (b.conversation_id as string) ||
+      (b.conversationId as string) ||
+      (b.thread_id as string) ||
+      (b.threadId as string) ||
+      (b.session_id as string) ||
+      (b.sessionId as string)
+    if (bodyHint) return bodyHint
+
+    // 优先级 2.5：metadata 中的 session/conversation
+    const metadata = b.metadata as Record<string, unknown> | undefined
+    if (metadata) {
+      const metaHint =
+        (metadata.session_id as string) ||
+        (metadata.conversation_id as string)
+      if (metaHint) return metaHint
+    }
+
+    // 优先级 3：无显式 ID，返回 undefined（kiroApi 用 history fingerprint 兜底）
+    return undefined
+  }
+
   constructor(config: Partial<ProxyConfig> = {}, events: ProxyServerEvents = {}) {
     this.config = {
       enabled: false,
@@ -269,6 +312,9 @@ export class ProxyServer {
       totalCredits: 0,
       inputTokens: 0,
       outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
       startTime: Date.now(),
       accountStats: new Map(),
       endpointStats: new Map(),
@@ -467,6 +513,12 @@ export class ProxyServer {
           const { ProxyAgent } = require('undici')
           return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
         }
+        const { getSystemProxy } = require('./systemProxy')
+        const systemProxy = getSystemProxy()
+        if (systemProxy) {
+          const { ProxyAgent } = require('undici')
+          return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
+        }
         return undefined
       })()
       const { fetch: undiciFetch } = require('undici')
@@ -579,6 +631,9 @@ export class ProxyServer {
       totalCredits: this.stats.totalCredits,
       inputTokens: this.stats.inputTokens,
       outputTokens: this.stats.outputTokens,
+      cacheReadTokens: this.stats.cacheReadTokens,
+      cacheWriteTokens: this.stats.cacheWriteTokens,
+      reasoningTokens: this.stats.reasoningTokens,
       startTime: this.stats.startTime,
       accountStats: this.stats.accountStats,
       endpointStats: this.stats.endpointStats,
@@ -754,28 +809,44 @@ export class ProxyServer {
   async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
     const now = Date.now()
     
+    let kiroModels: KiroModel[]
+    let fromCache = false
+
     if (this.modelCache && (now - this.modelCache.timestamp) < this.MODEL_CACHE_TTL) {
-      return { models: this.modelCache.models.map(ProxyServer.mapKiroModelToApi), fromCache: true }
-    }
-
-    this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
-    this.throwIfAborted(signal)
-    if (!account) {
-      return { models: [], fromCache: false }
-    }
-
-    try {
-      const kiroModels = await fetchKiroModels(account, signal)
-      if (kiroModels.length > 0) {
-        this.modelCache = { models: kiroModels, timestamp: now }
+      kiroModels = this.modelCache.models
+      fromCache = true
+    } else {
+      this.throwIfAborted(signal)
+      const account = await this.getAvailableAccount(signal)
+      this.throwIfAborted(signal)
+      if (!account) {
+        return { models: [], fromCache: false }
       }
-      return { models: kiroModels.map(ProxyServer.mapKiroModelToApi), fromCache: false }
-    } catch (error) {
-      if (this.isAbortError(error, signal)) throw error
-      console.error('[ProxyServer] Failed to fetch models:', error)
-      return { models: [], fromCache: false }
+
+      try {
+        kiroModels = await fetchKiroModels(account, signal)
+        if (kiroModels.length > 0) {
+          this.modelCache = { models: kiroModels, timestamp: now }
+        }
+      } catch (error) {
+        if (this.isAbortError(error, signal)) throw error
+        console.error('[ProxyServer] Failed to fetch models:', error)
+        return { models: [], fromCache: false }
+      }
     }
+
+    // 合并隐藏模型（与 /v1/models 端点一致）
+    const modelIds = new Set(kiroModels.map(m => m.modelId))
+    const hiddenModels: KiroModel[] = [
+      { modelId: 'claude-3.7-sonnet', modelName: 'Claude 3.7 Sonnet', description: 'Claude 3.7 Sonnet (hidden)', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
+      { modelId: 'simple-task', modelName: 'Simple Task', description: 'Kiro fast model (routes to Haiku)', supportedInputTypes: ['TEXT'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 4096 } } as KiroModel,
+      { modelId: 'CLAUDE_SONNET_4_20250514_V1_0', modelName: 'Claude Sonnet 4 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
+      { modelId: 'CLAUDE_HAIKU_4_5_20251001_V1_0', modelName: 'Claude Haiku 4.5 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
+      { modelId: 'CLAUDE_3_7_SONNET_20250219_V1_0', modelName: 'Claude 3.7 Sonnet (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel
+    ]
+    const merged = [...kiroModels, ...hiddenModels.filter(m => !modelIds.has(m.modelId))]
+
+    return { models: merged.map(ProxyServer.mapKiroModelToApi), fromCache }
   }
 
   // 检查 Token 是否需要刷新
@@ -1305,6 +1376,13 @@ export class ProxyServer {
     } else if (path === '/admin/logs' && method === 'GET') {
       // 获取最近日志
       this.handleAdminLogs(res)
+    } else if (path === '/admin/cache/clear' && method === 'POST') {
+      // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
+      const { clearAllCaches } = require('./kiroApi')
+      const cleared = clearAllCaches()
+      const promptCacheCleared = promptCacheTracker.clear()
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
     } else {
       this.sendError(res, 404, 'Admin endpoint not found')
     }
@@ -1400,15 +1478,18 @@ export class ProxyServer {
     return 'api_error'
   }
 
-  private buildClaudeUsage(usage: { inputTokens: number; outputTokens: number; cacheWriteTokens?: number; cacheReadTokens?: number }): { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } {
-    const claudeUsage = {
-      input_tokens: usage.inputTokens,
-      output_tokens: usage.outputTokens
-    }
+  private buildClaudeUsage(
+    usage: { inputTokens: number; outputTokens: number; cacheWriteTokens?: number; cacheReadTokens?: number },
+    simulatedCache?: { cacheCreationInputTokens: number; cacheReadInputTokens: number }
+  ): { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number } {
+    // 优先使用 Kiro 后端返回的真实 cache tokens，否则用模拟器的值
+    const cacheWrite = usage.cacheWriteTokens || simulatedCache?.cacheCreationInputTokens || 0
+    const cacheRead = usage.cacheReadTokens || simulatedCache?.cacheReadInputTokens || 0
     return {
-      ...claudeUsage,
-      ...(usage.cacheWriteTokens ? { cache_creation_input_tokens: usage.cacheWriteTokens } : {}),
-      ...(usage.cacheReadTokens ? { cache_read_input_tokens: usage.cacheReadTokens } : {})
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      ...(cacheWrite ? { cache_creation_input_tokens: cacheWrite } : {}),
+      ...(cacheRead ? { cache_read_input_tokens: cacheRead } : {})
     }
   }
 
@@ -1631,7 +1712,11 @@ export class ProxyServer {
 
     // 隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
     const hiddenModels = [
-      buildClientModel({ id: 'claude-3.7-sonnet', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (hidden)', modelName: 'Claude 3.7 Sonnet', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 })
+      buildClientModel({ id: 'claude-3.7-sonnet', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (hidden)', modelName: 'Claude 3.7 Sonnet', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
+      buildClientModel({ id: 'simple-task', created: now, ownedBy: 'kiro-api', description: 'Kiro fast model for intent classification and lightweight tasks (routes to Haiku)', modelName: 'Simple Task', supportedInputTypes: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096 }),
+      buildClientModel({ id: 'CLAUDE_SONNET_4_20250514_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude Sonnet 4 (CodeWhisperer internal ID)', modelName: 'Claude Sonnet 4 (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
+      buildClientModel({ id: 'CLAUDE_HAIKU_4_5_20251001_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude Haiku 4.5 (CodeWhisperer internal ID)', modelName: 'Claude Haiku 4.5 (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
+      buildClientModel({ id: 'CLAUDE_3_7_SONNET_20250219_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (CodeWhisperer internal ID)', modelName: 'Claude 3.7 Sonnet (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 })
     ]
 
     // 预设模型（GPT 兼容别名）
@@ -1723,6 +1808,15 @@ export class ProxyServer {
     this.throwIfAborted(signal)
     const request: OpenAIChatRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
+
+    // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
+    if (!request.conversation_id) {
+      const hint = ProxyServer.extractSessionHint(req, request)
+      if (hint) {
+        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+        request.conversation_id = `${keyPrefix}:${hint}`
+      }
+    }
 
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
@@ -2043,12 +2137,16 @@ export class ProxyServer {
           this.stats.totalTokens += usage.inputTokens + usage.outputTokens
           this.stats.inputTokens += usage.inputTokens
           this.stats.outputTokens += usage.outputTokens
+          this.stats.cacheReadTokens += usage.cacheReadTokens || 0
+          this.stats.cacheWriteTokens += usage.cacheWriteTokens || 0
+          this.stats.reasoningTokens += usage.reasoningTokens || 0
           this.stats.totalCredits += usage.credits || 0
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
           this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
-          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits })
-          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: Date.now() - startTime, success: true })
+          const oaiRespTime = Date.now() - startTime
+          this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: oaiRespTime })
+          this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: oaiRespTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/chat/completions')
@@ -2192,6 +2290,15 @@ export class ProxyServer {
     const request: ClaudeRequest = JSON.parse(body)
     const matchedApiKey = (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey
 
+    // 提取 session hint（用于稳定 conversationId），拼入 API Key hash 隔离不同用户
+    if (!request.conversation_id) {
+      const hint = ProxyServer.extractSessionHint(req, request)
+      if (hint) {
+        const keyPrefix = matchedApiKey?.id?.slice(0, 8) || 'default'
+        request.conversation_id = `${keyPrefix}:${hint}`
+      }
+    }
+
     // 应用模型映射
     request.model = this.applyModelMapping(request.model, matchedApiKey?.id)
 
@@ -2236,6 +2343,21 @@ export class ProxyServer {
 
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry)
 
+      // 构建 prompt cache profile（用于模拟缓存 usage）
+      const estimatedInputTokens = Math.max(1, Math.round(JSON.stringify(kiroPayload).length * 0.3))
+      const cacheProfile = promptCacheTracker.buildClaudeProfile(
+        processedRequest.system,
+        processedRequest.messages,
+        processedRequest.tools,
+        estimatedInputTokens,
+        processedRequest.model
+      )
+      const cacheUsage = promptCacheTracker.compute(account.id, cacheProfile)
+
+      if (cacheProfile) {
+        proxyLogger.info('ProxyServer', `Prompt cache: ${cacheProfile.breakpoints.length} breakpoints, creation=${cacheUsage.cacheCreationInputTokens}, read=${cacheUsage.cacheReadInputTokens}`)
+      }
+
       // 记录请求详情到日志
       if (this.config.logRequests) {
         const userInput = kiroPayload.conversationState.currentMessage?.userInputMessage
@@ -2257,7 +2379,8 @@ export class ProxyServer {
 
       if (request.stream) {
         // 流式响应（流式不使用重试机制，错误由流处理）
-        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal)
+        await this.handleClaudeStream(res, account, kiroPayload, request.model, startTime, 0, undefined, false, 0, matchedApiKey, toolNameRegistry, signal,
+          cacheProfile ? { ...cacheUsage, cacheProfile, accountId: account.id } : undefined)
       } else {
         // 非流式响应（带重试机制）
         const { result, account: usedAccount } = await this.callWithRetry(
@@ -2270,6 +2393,13 @@ export class ProxyServer {
           signal
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
+
+        // 用缓存模拟的 usage 覆盖（如果有 cache profile）
+        if (cacheProfile && cacheUsage) {
+          if (cacheUsage.cacheCreationInputTokens > 0) response.usage.cache_creation_input_tokens = cacheUsage.cacheCreationInputTokens
+          if (cacheUsage.cacheReadInputTokens > 0) response.usage.cache_read_input_tokens = cacheUsage.cacheReadInputTokens
+          promptCacheTracker.update(usedAccount.id, cacheProfile)
+        }
 
         this.throwIfResponseClosed(res, signal)
         this.recordRequestSuccess()
@@ -2301,7 +2431,8 @@ export class ProxyServer {
     contentBlockIndex: number = 0,
     matchedApiKey?: import('./types').ApiKey,
     toolNameRegistry: ToolNameRegistry = new ToolNameRegistry(),
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    simulatedCacheUsage?: { cacheCreationInputTokens: number; cacheReadInputTokens: number; cacheProfile?: unknown; accountId?: string }
   ): Promise<void> {
     if (!headersSent) {
       res.writeHead(200, {
@@ -2353,8 +2484,33 @@ export class ProxyServer {
       callKiroApiStream(
         account as any,
         kiroPayload,
-        (text, toolUse, isThinking, reasoningSignature) => {
+        (text, toolUse, isThinking, reasoningSignature, redactedContent) => {
           if (signal?.aborted || this.isResponseClosed(res)) return
+          // 优先处理 redacted_thinking（加密的 thinking 块，需单独 content_block）
+          if (redactedContent) {
+            if (hasStartedTextBlock) {
+              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
+              currentBlockIndex++
+              hasStartedTextBlock = false
+            }
+            if (hasStartedThinkingBlock) {
+              flushThinkingSignature()
+              const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+              res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
+              currentBlockIndex++
+              hasStartedThinkingBlock = false
+            }
+            const blockStart = createClaudeStreamEvent('content_block_start', {
+              index: currentBlockIndex,
+              content_block: { type: 'redacted_thinking', data: redactedContent }
+            })
+            res.write(`event: content_block_start\ndata: ${JSON.stringify(blockStart)}\n\n`)
+            const blockStop = createClaudeStreamEvent('content_block_stop', { index: currentBlockIndex })
+            res.write(`event: content_block_stop\ndata: ${JSON.stringify(blockStop)}\n\n`)
+            currentBlockIndex++
+            return
+          }
           if (text && text.trim()) {
             if (isThinking) {
               // 原生 thinking 内容 → 输出为 Anthropic thinking block
@@ -2479,8 +2635,12 @@ export class ProxyServer {
           this.events.onCreditsUpdate?.(this.stats.totalCredits)
           this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
           this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
-          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits })
-          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: Date.now() - startTime, success: true })
+          this.stats.cacheReadTokens += usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens || 0
+          this.stats.cacheWriteTokens += usage.cacheWriteTokens || simulatedCacheUsage?.cacheCreationInputTokens || 0
+          this.stats.reasoningTokens += usage.reasoningTokens || 0
+          const respTime = Date.now() - startTime
+          this.events.onResponse?.({ path: '/v1/messages', model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens || simulatedCacheUsage?.cacheReadInputTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime: respTime })
+          this.recordRequest({ path: '/v1/messages', model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime: respTime, success: true })
           // 记录 API Key 用量
           if (matchedApiKey) {
             this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, model, '/v1/messages')
@@ -2548,11 +2708,15 @@ export class ProxyServer {
             }
             resolve()
           } else {
+            // 成功后更新 prompt cache tracker
+            if (simulatedCacheUsage?.cacheProfile && simulatedCacheUsage?.accountId) {
+              promptCacheTracker.update(simulatedCacheUsage.accountId, simulatedCacheUsage.cacheProfile as any)
+            }
             // 发送 message_delta（包含完整 usage 信息）
             const stopReason = hasToolCalls ? 'tool_use' : 'end_turn'
             const messageDelta = createClaudeStreamEvent('message_delta', {
               delta: { stop_reason: stopReason, stop_sequence: null } as any,
-              usage: this.buildClaudeUsage(usage)
+              usage: this.buildClaudeUsage(usage, simulatedCacheUsage)
             })
             res.write(`event: message_delta\ndata: ${JSON.stringify(messageDelta)}\n\n`)
             // 发送 message_stop

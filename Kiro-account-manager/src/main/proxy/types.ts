@@ -14,6 +14,8 @@ export interface OpenAIChatRequest {
   conversation_id?: string
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'max' | string
+  thinking?: { type: 'enabled'; budget_tokens?: number } | { type: 'adaptive' } | { type: 'disabled' }
 }
 
 export interface OpenAIMessage {
@@ -171,6 +173,9 @@ export interface ClaudeRequest {
   conversation_id?: string
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
+  anthropic_beta?: string[]
+  output_config?: { effort?: string; task_budget?: { type: 'tokens'; total: number; remaining?: number } }
+  context_management?: { type?: string; [key: string]: unknown }
 }
 
 export interface ClaudeMessage {
@@ -190,6 +195,7 @@ export interface ClaudeContentBlock {
   text?: string
   thinking?: string
   signature?: string
+  data?: string
   source?: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | ClaudeDocumentSource
   id?: string
   name?: string
@@ -235,7 +241,7 @@ export interface ClaudeStreamEvent {
   message?: Partial<ClaudeResponse>
   index?: number
   content_block?: ClaudeContentBlock
-  delta?: { type: string; text?: string; thinking?: string; signature?: string; reasoning_content?: string; stop_reason?: string; stop_sequence?: string }
+  delta?: { type: string; text?: string; thinking?: string; signature?: string; data?: string; reasoning_content?: string; stop_reason?: string; stop_sequence?: string }
   usage?: { input_tokens?: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }
   error?: { type: string; message: string }
 }
@@ -338,10 +344,11 @@ export interface KiroCachePoint {
 }
 
 export interface KiroReasoningContent {
-  reasoningText: {
+  reasoningText?: {
     text: string
     signature?: string
   }
+  redactedContent?: string
 }
 
 export interface KiroRequestContext {
@@ -484,6 +491,8 @@ export interface ProxyConfig {
   clientDrivenToolExecution?: boolean
   // 禁用工具调用（移除 tools 参数）
   disableTools?: boolean
+  // Payload 大小限制（KB），超过时截断工具结果
+  payloadSizeLimitKB?: number
   // 单账号模式下额度耗尽自动切换到下一个账号
   autoSwitchOnQuotaExhausted?: boolean
   // 模型映射规则
@@ -516,6 +525,9 @@ export interface ProxyStats {
   totalCredits: number // 累计总 credits（所有请求）
   inputTokens: number
   outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  reasoningTokens: number
   startTime: number
   accountStats: Map<string, AccountStats>
   // 按端点统计
@@ -558,6 +570,9 @@ export interface RequestLog {
   accountId: string
   inputTokens: number
   outputTokens: number
+  cacheReadTokens?: number
+  cacheWriteTokens?: number
+  reasoningTokens?: number
   credits?: number // Kiro API 返回的 credit 使用量
   responseTime: number
   success: boolean

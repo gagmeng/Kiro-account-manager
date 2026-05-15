@@ -50,6 +50,7 @@ const en = {
     kproxy: 'K-Proxy',
     register: 'Register',
     subscription: 'Subscription',
+    logs: 'Logs',
     settings: 'Settings',
     about: 'About'
   },
@@ -455,6 +456,10 @@ const en = {
     historyImport: 'Import',
     batchAutoImport: 'Auto Import',
     batchAutoImportDesc: 'Verify and import to account manager on success',
+    autoFetchProLink: 'Fetch Pro Link',
+    autoFetchProLinkDesc: 'Auto fetch Kiro Pro subscription link after registration',
+    fetchingProLink: 'Fetching Pro subscription link',
+    linkCopied: 'Link copied to clipboard',
     batchRetries: 'Retries',
     batchConcurrency: 'Concurrency',
     batchRetrying: 'Retrying ({current}/{max})...',

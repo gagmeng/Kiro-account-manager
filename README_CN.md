@@ -272,6 +272,103 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.6.5 (2026-5-15)
+
+#### Prompt Cache 模拟器
+- **新增**: 完整的 prompt cache 模拟 — 追踪 `cache_control` 断点，按账号计算 `cache_read_input_tokens` 和 `cache_creation_input_tokens`，在 API 响应中返回真实缓存 usage
+- **新增**: 反代面板显示缓存命中率百分比 badge
+- **新增**: 三级检测：工具 → system → 消息块，支持 `ephemeral` TTL（5分钟/1小时）
+
+#### 前端面板增强
+- **新增**: 第二行统计卡片 — 总 Tokens、输入/输出、缓存命中率、推理 Tokens、成功率、Credits
+- **新增**: 大数字自动缩写（如 `206.3M`、`1096K`），hover 显示完整数值
+- **新增**: 日志表新增列 — 缓存读取（绿色）、响应耗时
+- **新增**: 侧边栏新增系统日志页面 — 完整控制台输出、虚拟滚动、级别筛选、搜索、自动跟随
+
+#### 系统日志页面
+- **新增**: 独立日志页面，显示所有系统输出（反代、API、账号、后台任务）
+- **新增**: Console 拦截器，`console.log/warn/error` 全部进入日志存储
+- **新增**: 虚拟滚动（`@tanstack/react-virtual`）— 10 万条以上不卡顿
+- **新增**: 智能自动滚动 — 在底部自动跟随，向上滚动暂停，浮动「回到底部」按钮显示新日志数
+- **新增**: 级别筛选按钮组（ALL/DEBUG/INFO/WARN/ERROR），每个级别显示彩色计数
+- **新增**: Grid 对齐列、分类颜色编码（Kiro=蓝、ProxyServer=紫、KiroAPI=青）
+- **新增**: 点击展开数据详情（JSON 格式化），流式事件聚合为单条摘要
+
+#### 日志优化
+- **优化**: 所有 API 日志（CBOR/REST）显示账号邮箱，方便识别来源
+- **优化**: API 响应日志拆分为一行摘要 + 可展开 JSON 详情（点击 ⓘ 查看）
+- **优化**: 日志中移除 token 明文（安全），改为 `token=N字符` 长度指示
+- **优化**: 冗余多行日志合并 — `[IPC]`、`[Kiro API]`、`[Kiro REST API]` 每次请求/响应各 1 行
+- **优化**: `[KiroPayload]` 和 `[KiroAPI] Request to` 结构化数据放入可展开详情
+- **移除**: `[REST->Unified] Converting response` 重复日志、`Using K-Proxy agent` 噪音日志
+
+#### 日志查看器增强
+- **优化**: 反代详细日志弹窗 — 分页改为虚拟滚动 + 智能自动跟随 + 「回到底部」浮动按钮
+- **优化**: 系统日志页面 — 新增时间范围筛选（1h/6h/1d/7d）、分类下拉、显示条数选择器（5K–100K）
+- **优化**: 系统日志拉取数量跟随用户选择的显示条数，不再固定 3000
+- **优化**: 两个日志页面统一交互体验：向上滚动暂停跟随、底部状态指示、新日志数 badge
+
+#### 高级配置
+- **新增**: Payload 大小限制可在高级设置中配置（256KB–10240KB，默认 1536KB/1.5MB）
+- **变更**: Payload 截断阈值从 380KB 提升到 1.5MB — 支持 200K+ token 大上下文模型，避免误截断
+- **变更**: 工具结果截断长度从 2000 提升到 4000 字符
+
+#### Bug 修复
+- **修复**: `tool_result content block N requires text` — 空/null 工具结果规范化为 `"(no output)"`，不再抛 400
+- **修复**: Thinking 参数发送给非 Claude 模型导致 400 — 现在仅对 Claude 4+ 模型发送（`modelSupportsThinkingParam()`）
+- **修复**: 流式事件日志刷屏 — 开启 `logStreamEvents` 时聚合为单条请求摘要
+- **新增**: 隐藏模型 ID 加入模型列表 — `simple-task`、`CLAUDE_SONNET_4_20250514_V1_0`、`CLAUDE_HAIKU_4_5_20251001_V1_0`、`CLAUDE_3_7_SONNET_20250219_V1_0`
+
+### v1.6.4 (2026-5-14)
+
+#### API 反代
+- **修复**: Claude Code 的 `thinking` 参数不再触发 `400 REQUEST_BODY_INVALID` — 所有 thinking 请求统一映射为 Kiro 枚举 `{ type: "adaptive" }`（Kiro schema 仅接受 `["adaptive", "disabled"]`）
+- **修复**: `context_management`、`effort`、`anthropic_beta` 不再注入 `additionalModelRequestFields` — Kiro schema 不允许额外属性，仅 `thinking` 可用
+- **修复**: System prompt 不再以 `--- SYSTEM PROMPT ---` 文本标记嵌入用户消息（被 Claude 模型识别为 prompt injection）— 改用 Kiro 官方 Human/AI pair 注入方式，与官方 IDE 行为一致
+- **修复**: CodeWhisperer 模型 ID 解析不再把 `claude-opus-4.7` 错误映射到 Sonnet 模型 — 匹配逻辑新增模型家族互斥（opus/sonnet/haiku 不可交叉匹配）
+- **修复**: 模型匹配不再搜索 description 文本，降低新模型未在 `ListAvailableModels` 中时的误匹配
+- **修复**: Token 估算修正 — 输入（JSON payload）使用 0.3 token/字符，输出（自然语言）使用 0.4 token/字符，并提供 CJK 感知的 `estimateTokens()` 辅助函数
+- **变更**: AmazonQ CLI 端点 origin 更新为 `AI_EDITOR`
+
+#### 会话稳定性与防封
+- **新增**: `conversationId` 稳定化 — 同一客户端会话的多轮请求复用同一个 `conversationId`（与官方 Kiro IDE 行为一致）
+- **新增**: 三级会话检测：HTTP Header（`X-Claude-Code-Session-Id`、`x-opencode-session`、`x-session-affinity`）→ Body 字段（`conversation_id`、`thread_id`、`session_id`）→ History 指纹兜底
+- **新增**: API Key 隔离 — 不同 API Key 自动获得独立的会话命名空间
+- **新增**: `/admin/cache/clear` 端点 — 手动清除 conversationId 映射和模型缓存
+
+#### Claude Code 兼容性
+- **新增**: `redacted_thinking` 加密思考块支持 — Kiro `ReasoningContentEvent.redactedContent` 解码并转换为 Anthropic `redacted_thinking` 内容块（请求输入和响应输出双向支持）
+- **新增**: Payload 大小限制器 — 当 payload 超过 380KB 时，从最旧的大型工具结果开始截断为 2000 字符（保留截断标记），防止 Kiro API 拒绝长会话
+- **新增**: OpenAI 兼容的 `thinking` 参数也映射到 Kiro `additionalModelRequestFields`
+
+### v1.6.2 (2026-5-13)
+
+#### 账号切换
+- **修复**: 切换 Google/GitHub 社交登录账号后 Kiro IDE 不再报 `Invalid token` 错误
+- **修复**: 切号前先刷新 Token，确保写入 `kiro-auth-token.json` 的 `accessToken` 始终有效
+- **修复**: `profileArn` 始终写入 token 文件，未存储时根据 provider 自动推导（Google/GitHub → 社交 profile，BuilderId → Builder profile）
+- **修复**: 社交登录的 token 文件格式与官方 Kiro IDE 完全一致（不再多余写入 `region`、`clientIdHash` 字段）
+- **修复**: Kiro CLI 切号同步支持切号前刷新 Token、写入 `profileArn`，并正确区分 social 和 IdC 登录
+- **修复**: CLI 的 `isSocial` 判断不再把 BuilderId 错误归类为社交登录
+
+#### 一键客户端配置
+- **修复**: 一键配置客户端优先从代理服务加载模型（与"查看模型"一致），代理未启动时回退到账号直连
+- **修复**: Claude Code 配置现在写入 `ANTHROPIC_DEFAULT_HAIKU_MODEL`、`ANTHROPIC_DEFAULT_OPUS_MODEL`、`ANTHROPIC_DEFAULT_SONNET_MODEL` 字段，匹配完整官方配置格式
+- **修复**: 隐藏模型（如 `claude-3.7-sonnet`）现在也会出现在一键配置的模型列表中
+
+#### 代理与网络
+- **新增**: 系统代理自动检测 — Windows（注册表 `Internet Settings`）和 macOS（`scutil --proxy`），30 秒缓存
+- **修复**: 所有出站连接统一代理优先级：用户手动设置代理 → 系统代理 → 直连
+- **修复**: 注册模块（MoEmail、TempMail.Plus、Outlook OAuth、TLS 客户端）不再使用独立的代理输入框，自动跟随全局代理设置
+- **修复**: 反代服务的图片下载也支持系统代理回退
+
+#### 注册功能
+- **新增**: 注册成功后自动获取 Kiro Pro 订阅链接 — 注册页面开关控制，结果展示在批量订阅页面「获取链接」标签
+- **优化**: 并发注册日志隔离 — 每个批量任务日志自动加 `[#taskId]` 前缀，避免多线程日志混乱
+- **优化**: 注册日志事件携带结构化 `{ message, taskId }`，便于过滤
+- **修复**: `refreshAppJSConfig` 使用 Promise 锁防止并发 worker 竞争下载 app.js
+- **移除**: 注册页面的独立代理输入框（统一使用全局代理设置）
+
 ### v1.6.1 (2026-5-12)
 
 #### API 反代兼容性

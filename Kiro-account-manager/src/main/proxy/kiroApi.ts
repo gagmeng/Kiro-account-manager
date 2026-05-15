@@ -17,6 +17,7 @@ import type {
 } from './types'
 import { proxyLogger } from './logger'
 import { getKProxyService } from '../kproxy'
+import { getSystemProxy } from './systemProxy'
 
 // 是否使用 K-Proxy 代理发送 API 请求（从主进程导入）
 let useKProxyForApi = false
@@ -30,7 +31,13 @@ export function setLogStreamEvents(enabled: boolean): void {
   logStreamEvents = enabled
 }
 
-// 获取网络代理 agent（优先 K-Proxy，其次应用级代理设置）
+// Payload 大小限制（KB），用户可在高级设置中调整
+let payloadSizeLimitKB = 1536 // 默认 1.5MB
+export function setPayloadSizeLimitKB(limitKB: number): void {
+  payloadSizeLimitKB = Math.max(256, Math.min(10240, limitKB))
+}
+
+// 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
 function getNetworkAgent(): ProxyAgent | undefined {
   if (useKProxyForApi) {
     const kproxyService = getKProxyService()
@@ -43,6 +50,10 @@ function getNetworkAgent(): ProxyAgent | undefined {
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
   if (envProxy) {
     return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
+  }
+  const systemProxy = getSystemProxy()
+  if (systemProxy) {
+    return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
   }
   return undefined
 }
@@ -75,7 +86,7 @@ const KIRO_ENDPOINTS = [
   },
   {
     url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
-    origin: 'AmazonQ',
+    origin: 'AI_EDITOR',
     amzTarget: 'AmazonQDeveloperStreamingService.SendMessage',
     name: 'AmazonQCLI'
   }
@@ -195,18 +206,26 @@ function modelTokens(value: string): string[] {
   return value.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
 }
 
-function modelText(model: KiroModel): string {
-  return [model.modelId, model.modelName, model.description].filter(Boolean).join(' ')
-}
-
 function matchesRequestedModel(model: KiroModel, requestedModelId: string): boolean {
+  // 1. modelId 级精确匹配（去除符号后比较）
   const requestedKey = normalizeModelKey(requestedModelId)
-  const candidateKey = normalizeModelKey(modelText(model))
-  if (candidateKey === requestedKey || candidateKey.includes(requestedKey)) return true
+  const modelIdKey = normalizeModelKey(model.modelId)
+  if (modelIdKey === requestedKey || modelIdKey.includes(requestedKey)) return true
+  // 2. modelName 精确匹配
+  if (model.modelName && normalizeModelKey(model.modelName).includes(requestedKey)) return true
+  // 3. token 匹配（所有请求 token 必须在 modelId+modelName 中命中，不搜索 description 避免误匹配）
   const tokens = modelTokens(requestedModelId).filter(token => token !== 'latest' && token !== 'model')
   if (tokens.length === 0) return false
-  const candidateTokens = new Set(modelTokens(modelText(model)))
-  return tokens.every(token => candidateTokens.has(token))
+  const candidateTokens = new Set(modelTokens(`${model.modelId} ${model.modelName || ''}`))
+  // 必须全部 token 命中
+  if (!tokens.every(token => candidateTokens.has(token))) return false
+  // 防止模型家族冲突：如果请求包含 opus/sonnet/haiku，候选必须也包含对应的
+  const families = ['opus', 'sonnet', 'haiku']
+  for (const family of families) {
+    if (tokens.includes(family) && !candidateTokens.has(family)) return false
+    if (!tokens.includes(family) && candidateTokens.has(family)) return false
+  }
+  return true
 }
 
 function isCodeWhispererModelId(modelId: string): boolean {
@@ -807,7 +826,9 @@ export function buildKiroPayload(
     ...(tools.length > 0 ? { tools } : {})
   }
 
-  const conversationId = messageOptions?.conversationId || uuidv4()
+  // conversationId 稳定化：同一会话的多轮请求复用同一个 conversationId
+  // 优先级：客户端显式 conversation_id → sessionHint（header 提取）→ history fingerprint → 新 UUID
+  const conversationId = resolveConversationId(history, messageOptions?.conversationId)
   const payload: KiroPayload = {
     conversationState: {
       agentContinuationId: uuidv4(),
@@ -843,6 +864,37 @@ export function buildKiroPayload(
     payload.additionalModelRequestFields = additionalModelRequestFields
   }
 
+  // 工具结果裁剪：payload 超过限制时，从最旧的历史 toolResult 开始截断内容
+  // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
+  const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
+  const TOOL_RESULT_TRUNCATE_LENGTH = 4000
+  let initialPayloadSize = JSON.stringify(payload).length
+  if (initialPayloadSize > PAYLOAD_SIZE_LIMIT && payload.conversationState.history) {
+    const historyMessages = payload.conversationState.history
+    let truncatedCount = 0
+    for (const message of historyMessages) {
+      if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
+      const userToolResults = message.userInputMessage?.userInputMessageContext?.toolResults
+      if (!userToolResults) continue
+      for (const toolResult of userToolResults) {
+        if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
+        if (!toolResult.content) continue
+        for (const contentItem of toolResult.content) {
+          if (initialPayloadSize <= PAYLOAD_SIZE_LIMIT) break
+          if (contentItem.text && contentItem.text.length > TOOL_RESULT_TRUNCATE_LENGTH) {
+            const originalLen = contentItem.text.length
+            contentItem.text = `${contentItem.text.slice(0, TOOL_RESULT_TRUNCATE_LENGTH)}\n\n[Truncated by proxy: original ${originalLen} chars]`
+            truncatedCount++
+            initialPayloadSize = JSON.stringify(payload).length
+          }
+        }
+      }
+    }
+    if (truncatedCount > 0) {
+      console.log(`[KiroPayload] Truncated ${truncatedCount} large tool results to fit payload size limit (final size: ${initialPayloadSize} bytes)`)
+    }
+  }
+
   // 调试日志
   console.log(`[KiroPayload] Built payload (native history mode):`, {
     contentLength: finalContent.length,
@@ -851,10 +903,61 @@ export function buildKiroPayload(
     toolsCount: tools.length,
     toolResultsCount: toolResults.length,
     hasProfileArn: payload.profileArn !== undefined,
-    hasThinking: !!additionalModelRequestFields?.thinking
+    hasThinking: !!additionalModelRequestFields?.thinking,
+    payloadSize: initialPayloadSize
   })
 
   return payload
+}
+
+// conversationId 稳定化：同一会话的多轮请求复用同一个 conversationId
+// 策略：sessionHint（由 proxyServer 从 header/body 提取）→ 稳定映射到固定 conversationId
+// 无 sessionHint 时用 history fingerprint 兜底
+const conversationCache = new Map<string, { id: string; timestamp: number }>()
+const CONVERSATION_CACHE_TTL = 2 * 60 * 60 * 1000 // 2 小时
+const CONVERSATION_CACHE_MAX = 1000
+
+function resolveConversationId(history: KiroHistoryMessage[], sessionHint?: string): string {
+  // sessionHint 已包含 API Key hash 前缀（由 proxyServer 注入），天然隔离不同用户
+  const key = sessionHint || fingerprintFromHistory(history)
+  if (!key) return uuidv4()
+
+  const now = Date.now()
+  const cached = conversationCache.get(key)
+  if (cached) {
+    cached.timestamp = now
+    return cached.id
+  }
+
+  // 清理过期缓存
+  if (conversationCache.size > CONVERSATION_CACHE_MAX) {
+    const cutoff = now - CONVERSATION_CACHE_TTL
+    for (const [k, v] of conversationCache) {
+      if (v.timestamp < cutoff) conversationCache.delete(k)
+    }
+  }
+
+  const id = uuidv4()
+  conversationCache.set(key, { id, timestamp: now })
+  return id
+}
+
+function fingerprintFromHistory(history: KiroHistoryMessage[]): string | undefined {
+  if (history.length === 0) return undefined
+  const fp = history.slice(0, 2).map(msg =>
+    `${msg.userInputMessage?.content || ''}|${msg.assistantResponseMessage?.content || ''}`
+  ).join('::')
+  const crypto = require('crypto')
+  return crypto.createHash('sha256').update(fp).digest('hex').slice(0, 32)
+}
+
+// 清除所有内存缓存
+export function clearAllCaches(): { conversation: number; model: number } {
+  const conversationCount = conversationCache.size
+  const modelCount = codeWhispererModelCache.size
+  conversationCache.clear()
+  codeWhispererModelCache.clear()
+  return { conversation: conversationCount, model: modelCount }
 }
 
 // machineId 稳定生成缓存（用于无绑定 machineId 且 K-Proxy 不可用时的兆底）
@@ -933,7 +1036,7 @@ function throwIfAborted(signal?: AbortSignal): void {
 export async function callKiroApiStream(
   account: ProxyAccount,
   payload: KiroPayload,
-  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string) => void,
+  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   signal?: AbortSignal,
@@ -1078,10 +1181,26 @@ interface ToolUseState {
   inputBuffer: string
 }
 
+// Token 估算（仅作兜底，Kiro 后端返回真实值时不使用）
+// 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
+export function estimateTokens(text: string): number {
+  let cjkChars = 0
+  let otherChars = 0
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) || (code >= 0xF900 && code <= 0xFAFF)) {
+      cjkChars++
+    } else {
+      otherChars++
+    }
+  }
+  return Math.round(cjkChars * 0.6 + otherChars * 0.3)
+}
+
 // 解析 AWS Event Stream 二进制格式
 async function parseEventStream(
   body: ReadableStream<Uint8Array>,
-  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string) => void,
+  onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   inputChars: number = 0,  // 输入字符长度，用于估算 input tokens
@@ -1104,10 +1223,14 @@ async function parseEventStream(
   // 累积输出文本长度，用于估算 tokens
   let totalOutputChars = 0
   
-  // 估算 input tokens（基于输入字符长度）
-  // 约 3 个字符 = 1 token（混合中英文场景的保守估计）
+  // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
+  const streamEventCounts: Record<string, number> = {}
+  
+  // 估算 input tokens（基于输入字符长度，仅 Kiro 后端不返回 tokenUsage 时使用）
+  // 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
+  // payload 是 JSON 以英文为主，使用 0.3 系数
   if (inputChars > 0) {
-    usage.inputTokens = Math.max(1, Math.round(inputChars / 3))
+    usage.inputTokens = Math.max(1, Math.round(inputChars * 0.3))
   }
   
   // Tool use 状态跟踪 - 用于累积输入片段
@@ -1327,7 +1450,8 @@ async function parseEventStream(
             }
             
             if (logStreamEvents) {
-              proxyLogger.debug('Kiro', 'Event: ' + (eventType || 'unknown'), JSON.stringify(event).slice(0, 500))
+              // 聚合流式事件（不逐条输出，在 onComplete 时输出摘要）
+              streamEventCounts[eventType || 'unknown'] = (streamEventCounts[eventType || 'unknown'] || 0) + 1
             }
             
             // 处理 usageEvent
@@ -1379,18 +1503,21 @@ async function parseEventStream(
             }
             
             // 处理 reasoningContentEvent - Thinking 模式的推理内容
+            // Kiro ReasoningContentEvent 字段：[text, redactedContent, signature]
             if (eventType === 'reasoningContentEvent' || event.reasoningContentEvent) {
               const reasoning = event.reasoningContentEvent || event
-              // 推理内容可能包含 text 或 signature
               if (reasoning.text) {
-                // 传递 isThinking=true 标记这是思考内容
                 proxyLogger.info('Kiro', `Received reasoning content (isThinking=true): ${reasoning.text.slice(0, 50)}...`)
-                onChunk(reasoning.text, undefined, true, reasoning.signature)
+                onChunk(reasoning.text, undefined, true, reasoning.signature, undefined)
                 totalOutputChars += reasoning.text.length
-                // 累计 reasoning tokens（约 3 字符 = 1 token）
-                usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length / 3))
-              } else if (reasoning.signature) {
-                onChunk('', undefined, true, reasoning.signature)
+                usage.reasoningTokens += Math.max(1, Math.round(reasoning.text.length * 0.4))
+              } else if (reasoning.signature && !reasoning.redactedContent) {
+                onChunk('', undefined, true, reasoning.signature, undefined)
+              }
+              // 处理 redactedContent（重编辑的加密 thinking 内容）
+              if (reasoning.redactedContent) {
+                proxyLogger.info('Kiro', `Received redacted thinking content (len=${reasoning.redactedContent.length})`)
+                onChunk('', undefined, true, undefined, reasoning.redactedContent)
               }
               proxyLogger.debug('Kiro', 'reasoningContentEvent', JSON.stringify(reasoning).slice(0, 200))
             }
@@ -1511,11 +1638,16 @@ async function parseEventStream(
     }
     
     // 如果 API 没有返回 token 信息，基于输出字符长度估算
-    // Token 估算规则：约 4 个字符 = 1 token（对于英文），中文约 2 字符 = 1 token
-    // 这里使用保守估计：平均 3 个字符 = 1 token
+    // 输出是自然语言，中英混合平均约 0.4 token/字符
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
-      usage.outputTokens = Math.max(1, Math.round(totalOutputChars / 3))
+      usage.outputTokens = Math.max(1, Math.round(totalOutputChars * 0.4))
       proxyLogger.info('Kiro', `Estimated output tokens: ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
+    }
+    
+    // 流式事件聚合摘要
+    if (logStreamEvents && Object.keys(streamEventCounts).length > 0) {
+      const total = Object.values(streamEventCounts).reduce((a, b) => a + b, 0)
+      proxyLogger.debug('Kiro', `Stream events summary (${total} total)`, streamEventCounts)
     }
     
     throwIfAborted(signal)
@@ -1538,22 +1670,24 @@ export async function callKiroApi(
   content: string
   toolUses: KiroToolUse[]
   usage: KiroUsage
-  reasoningContent?: { text: string; signature?: string }
+  reasoningContent?: { text?: string; signature?: string; redactedContent?: string }
 }> {
   return new Promise((resolve, reject) => {
     let content = ''
     let reasoningText = ''
     let reasoningSignature: string | undefined
+    let redactedContent = ''
     const toolUses: KiroToolUse[] = []
     let usage: KiroUsage = { inputTokens: 0, outputTokens: 0, credits: 0 }
 
     callKiroApiStream(
       account,
       payload,
-      (text, toolUse, isThinking, signature) => {
+      (text, toolUse, isThinking, signature, redacted) => {
         if (isThinking) {
-          reasoningText += text
-          reasoningSignature = signature || reasoningSignature
+          if (text) reasoningText += text
+          if (signature) reasoningSignature = signature
+          if (redacted) redactedContent += redacted
         } else {
           content += text
         }
@@ -1563,13 +1697,12 @@ export async function callKiroApi(
       },
       (u) => {
         usage = u
-        if (reasoningText) {
-          resolve({
-            content,
-            toolUses,
-            usage,
-            reasoningContent: reasoningSignature ? { text: reasoningText, signature: reasoningSignature } : { text: reasoningText }
-          })
+        if (reasoningText || redactedContent) {
+          const rc: { text?: string; signature?: string; redactedContent?: string } = {}
+          if (reasoningText) rc.text = reasoningText
+          if (reasoningSignature) rc.signature = reasoningSignature
+          if (redactedContent) rc.redactedContent = redactedContent
+          resolve({ content, toolUses, usage, reasoningContent: rc })
           return
         }
         resolve({ content, toolUses, usage })
@@ -1708,19 +1841,14 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   const profileArn = resolveProfileArn(account)
   const body = JSON.stringify({ profileArn })
 
-  console.log('[KiroAPI] ListAvailableSubscriptions request:', {
-    url,
-    headers: { ...headers, Authorization: `Bearer ${account.accessToken?.substring(0, 20)}...` },
-    body
+  console.log(`[KiroAPI] ListAvailableSubscriptions [${account.email || account.id.slice(0, 8)}]`, {
+    url
   })
 
   try {
     const response = await fetchWithProxy(url, { method: 'POST', headers, body })
     const responseText = await response.text()
-    console.log('[KiroAPI] ListAvailableSubscriptions response:', {
-      status: response.status,
-      body: responseText.substring(0, 500)
-    })
+    console.log(`[KiroAPI] ListAvailableSubscriptions → ${response.status}`, JSON.parse(responseText))
     
     if (!response.ok) {
       return {}
