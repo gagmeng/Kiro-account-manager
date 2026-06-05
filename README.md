@@ -272,6 +272,479 @@ The project is configured with GitHub Actions workflow for auto building all pla
 ## 📋 Changelog
 
 
+### v1.7.4 (2026-6-5) — profileArn Refined Strategy + CI Fix + Log Redaction Fix + Registration Anti-Hang
+
+#### 🛡️ profileArn Strategy Refinement
+
+- **Fix**: Restored `resolveProfileArnForWrite` to return placeholder ARN for BuilderId — Kiro IDE internal logic depends on this field existing; removing it caused IDE malfunction
+- **Fix**: Non-streaming API endpoints (`ListAvailableModels`, `ListAvailableSubscriptions`, `CreateSubscriptionToken`, `setUserPreference`) now send placeholder ARN again (AWS 400 "profileArn must not be null")
+- **Fix**: Streaming endpoints (`generateAssistantResponse` / `SendMessageStreaming`) still do NOT send placeholder ARN (causes 403)
+- **Fix**: Disabled `migrateAccountDataIfNeeded` cleanup of placeholder ARNs from account data
+
+#### 🔧 GitHub Actions CI Fix
+
+- **Fix**: `softprops/action-gh-release@v1` uploading duplicate filenames causing 404 — replaced with `find + cp` flatten-and-dedup to `release-assets/` directory before upload
+- **New**: Added `yaml-language-server` schema declaration to suppress IDE YAML lint false-positives
+
+#### 📝 Log Redaction Fix
+
+- **Fix**: `inputTokens`, `outputTokens`, `cacheReadTokens`, `reasoningTokens` and other metric fields were incorrectly redacted as `***` — removed overly broad `'token'` matching rule, added `SAFE_KEYS` whitelist
+
+#### 🐛 Registration Fixes
+
+- **Fix**: `Registrar.destroy()` did not call `abort()`, causing destroyed registrars to continue executing async steps (e.g. sending OTP), leading to "no registration in progress" error when submitting verification code
+- **Fix**: Outlook IMAP `readLine()` had no timeout — when the server stalls mid-stream (network jitter / throttling / half-closed connection), the Promise hung forever, causing the mail-polling step to deadlock. Added 30s timeout with auto-reconnect on next retry
+
+#### 💎 Proxy Panel UX
+
+- **Fix**: "Preferred Endpoint" dropdown obscured by the "Security & Observability" card below (z-index stacking context fix)
+- **Improvement**: Entering the proxy panel no longer triggers a full account sync on every mount; sync only fires when accounts actually change
+
+---
+
+### v1.7.3 (2026-6-4) — Kiro IDE Token Bidirectional Sync + BuilderId Placeholder ARN Full Closure + Proactive Renewal + macOS Auto-Update Fix
+
+> This release focuses on the core failure "after switching accounts / refreshing tokens in this app, Kiro IDE desktop gets force-logged-out ~1 hour later", closes the chain of bugs where BuilderId accounts still got written placeholder profileArn in multiple paths, adds an optional IDE Token proactive-renewal capability (off by default), fixes macOS auto-update 404, and ships a Kiro IDE binary patcher script plus several UI tweaks.
+
+#### 🔥 Core Fix: Kiro IDE Token Bidirectional Sync (resolves "force-logout ~1h after switching")
+
+- **Fix**: 🔥 **`switch-account` wrote the already-rotated/invalidated old refreshToken to disk** — the old code only updated the local variable `accessToken` after calling OIDC for `access_v2 + refresh_v2`, but the `refreshToken` written into `~/.aws/sso/cache/kiro-auth-token.json` was still `v1` (immediately invalidated by BuilderId's rotating refresh-token mechanism). Kiro IDE's refresh loop later used `v1` against OIDC → 401 → `logoutAndForget()` force-logout
+- **Fix**: 🔥 **`refresh-account-token` ("Refresh Token" button) never wrote to disk at all** — the old code only updated the in-app store and notified the renderer; the disk token file was untouched, so Kiro IDE never saw the new token. The UI showed "refreshed" but IDE actually kept using the old one and hit the same 401 → logout ~1h later
+- **Fix**: 🔥 **`background-batch-refresh` (the IPC used by "Auto Refresh") also never wrote to disk** — the Auto Refresh feature (default every 5 minutes) refreshed all accounts but never synced to the IDE disk file. This was the biggest hidden hole after the switch/refresh-button fixes. Now every refreshed account, if recognized as the IDE current active account, is auto-synced
+- **Fix**: `switch-account` hardcoded `expiresAt = Date.now() + 3600*1000`; now uses the real `expiresIn` returned by OIDC
+- **Fix**: `switch-account` previously still wrote the old token on OIDC refresh failure (planting a landmine); now it errors out without writing and surfaces a clear message
+
+#### 🔁 New Module: `src/main/kiroAuthSync.ts` and Bidirectional Sync
+
+- **New**: `writeKiroAuthTokenFile` / `readKiroAuthTokenFile` shared helpers — uniformly read/write `~/.aws/sso/cache/kiro-auth-token.json` in a fully Kiro-IDE-compatible format (`mode 0o600` etc.); social / IdC field ordering matches the IDE source serializer
+- **New**: `parseAccessTokenClaims` — decodes the JWT body of an access token for `sub / email / aud`, used during reverse sync to identify "which account did the IDE just self-refresh"
+- **New**: `watchKiroAuthTokenFile` — uses `fs.watchFile` with content-level debouncing; hooked up on app start
+- **New**: **Reverse sync pipeline** — when Kiro IDE self-refreshes and writes new token to disk → the watcher fires → 3-tier account matching (JWT sub / `lastSwitchedAccountId` / refreshToken equality) finds the account in store → updates credentials → `webContents.send('kiro-ide-token-changed')` triggers renderer to `loadFromStorage`, UI immediately shows latest `expiresAt`
+- **New**: Anti-loop — `lastWrittenTokenSignature` (the token written by this app itself) is recognized by the watcher and skipped, preventing ping-pong between IDE and the app
+- **New**: `switchAccount` IPC returns `refreshedCredentials` (the real post-refresh access/refresh/expiresIn); the renderer immediately syncs to store, eliminating the cascading bug "store still holds v1 → next refresh hits invalidated refresh"
+
+#### 🛡️ BuilderId Placeholder profileArn Full Closure
+
+- **Fix**: 🔥 **Kiro IDE desktop's `FixedProfileArns` hardcodes the placeholder ARN `profile/AAAACCCCXXXX` for BuilderId** — calling `codewhisperer.us-east-1.amazonaws.com/ListAvailableModels` with this ARN deterministically triggers 403 "User is not authorized to make this call." The reverse-proxy side `kiroApi.ts`'s `resolveProfileArn` now returns no profileArn for BuilderId and unknown providers; all call sites (`fetchKiroModels` / `callKiroApiStream` / 3 subscription endpoints) guard with null-checks
+- **Fix**: 🔥 **4 disk-write paths (`switch-account` / `switch-account-cli` / `refresh-account-token` sync branch / `runProactiveRenewal`) still inlined the placeholder ARN** — BuilderId accounts were force-stamped this placeholder into `~/.aws/sso/cache/kiro-auth-token.json` or `~/.local/share/kiro-cli/data.sqlite3`, planting the same landmine for Kiro IDE / kiro-cli REST calls. All paths now use the unified `resolveProfileArnForWrite` helper, which always returns `undefined` for BuilderId
+- **New**: `kiroAuthSync.ts` centrally hosts `KIRO_BUILDER_ID_PLACEHOLDER_ARN` / `KIRO_SOCIAL_PROFILE_ARN`; reverse-proxy `kiroApi.ts` becomes a re-exporter, eliminating drift risk across 5 duplicated constants
+- **New**: Last-line-of-defense inside `writeKiroAuthTokenFile` — if a placeholder ARN is detected in input, it is automatically stripped to `undefined`, catching anything that bypassed the helper
+- **New**: On boot, `migrateAccountDataIfNeeded` performs a one-time scan of account data in electron-store, clearing placeholder ARNs written by older versions / Kiro IDE itself, then writes back idempotently
+
+#### 🆕 New: IDE Token Proactive Renewal (off by default)
+
+- **New**: A **"Proactive Token Renewal for IDE"** toggle has been added beneath the Auto Refresh block in Settings — when enabled, the app's main process refreshes + writes-to-disk ~15 minutes before the IDE active account's token expires, so Kiro IDE always sees ≥ 45 minutes remaining and its internal `attemptRefreshIfCloseToExpiry` never fires, completely eliminating any race against OIDC rotation
+- **New**: Maintains a single in-process timer (lowest possible cost) tied to the IDE current active account; `switch-account` / `refresh-account-token` / `logout-account` all schedule or clear the timer correctly with zero leaks
+- **New**: On renewal failure, the timer halts and the IDE's own refresh loop takes over — naturally complementary to the bidirectional-sync mechanism
+- **New**: Persisted in electron-store (`proactiveRenewalEnabled` key) and auto-restored after restarting the app
+
+#### 🧰 Kiro IDE Binary Patcher `scripts/patch-kiro-ide.cjs`
+
+- **New**: Cross-platform script — performs 3 precise regex replacements against Kiro IDE desktop's `extension.js` and the bundled JS under `packages/kiro-shared`:
+  - `getFixedProfileArn`: short-circuit `void 0` for BuilderId
+  - `supportsProfiles`: remove BuilderId from the IdC list
+  - `resolveProfileArn`: return `void 0` directly for BuilderId tokens
+- **New**: Also cleans the placeholder ARN persisted in `%APPDATA%/Kiro/User/globalStorage/kiro.kiro-agent/profile.json`
+- **New**: Idempotent (first-line MARKER) + backup (`.kpatch-backup`) + flags: `--dry-run` / `--restore` / `--verbose` / `--kiro-dir`; re-run the same command after Kiro IDE upgrades to re-patch
+- **Usage**: `node scripts/patch-kiro-ide.cjs --dry-run` for preview; `node scripts/patch-kiro-ide.cjs` to apply. Fully quit Kiro before running
+
+#### 🔧 Build / Release
+
+- **Fix**: 🔥 **macOS auto-update 404** — by default, `electron-builder` replaces spaces in `productName` with `.` for the mac zip filename (yielding `Kiro.Account.Manager-1.7.2-mac.zip`), but the `url` field in `latest-mac.yml` replaces spaces with `-` (pointing at `Kiro-Account-Manager-1.7.2-mac.zip`). The mismatch caused updater 404. `electron-builder.yml` now sets `mac.artifactName: ${name}-${version}-${arch}-mac.${ext}` and explicit `target: zip/dmg × [x64, arm64]`, unifying naming to `kiro-account-manager-…` across platforms and making `latest-mac.yml` include both x64 and arm64 entries so Apple Silicon users get a native arm64 build
+- **Note**: Existing v1.7.2 macOS users cannot auto-upgrade to v1.7.3 due to the above bug; please download the matching dmg/zip from [Releases](https://github.com/chaogei/Kiro-account-manager/releases/latest) manually one time
+
+#### 🎨 UI / Detail Tweaks
+
+- **Optimize**: Registration page — the "Log" card has been moved from the bottom of the page to right after the "Start Registration" button card, so live progress is visible at a glance
+- **Optimize**: Account toolbar — "Batch Check Account Info" and "Batch Refresh Token" both previously used the `RefreshCw` icon and were visually indistinguishable; now respectively switched to `Activity` (check/activity semantic) and `KeyRound` (refresh-token semantic, consistent with the card view) with i18n tooltips
+- **New**: Bidirectional-sync explainer block added beneath Auto Refresh in Settings — clarifying "Kiro IDE has its own internal refresh loop", "switch/refresh syncs to disk only for the IDE current active account", and "the app reverse-syncs back to store when IDE self-refreshes"
+- **New**: `onKiroIdeTokenChanged` IPC event — renderer subscribes and triggers `loadFromStorage` on receipt; the UI refreshes `expiresAt` instantly after IDE self-refresh
+
+#### 🔍 Validation
+
+- Full-project `npm run typecheck:node && npm run typecheck:web` both pass with zero errors
+- ReadLints reports zero warnings across all modified files
+- The Kiro IDE patcher script's `--dry-run` precisely targets all 5 candidate files on Windows D:\Program\Kiro (3 + 1 + 1 + 1 + 1 replacements)
+
+
+### v1.7.2 (2026-6-2) — Batch Subscription Link Enhancements + Card-Key Parsing Fix + Group Assignment on Add/Import
+
+> This release focuses on bulk import & quick-pick batched opening in the Subscription "Get Links" view, a boundary-character fix in card-key/credential parsing (resolving import-verification 401s), and assigning accounts to a chosen group when adding / batch-adding / importing.
+
+#### 🔗 Batch Subscription · Get Links
+
+- **New**: Bulk link import — paste multi-line text in a dialog; URLs are auto-extracted per line (plain URL, or "email<sep>URL" with sep = space / comma / tab / | / ----), de-duplicated by URL, and added as "success" entries so they can be opened (single / multi-select), copied, and exported just like existing links
+- **New**: Quick-pick "Top N" — one-click selects the top N available links from the list (default 10, count remembered across pages) for batched opening
+- **New**: Quick-pick "Next" — continues from the last cursor to select the next N, looping at the end; combined with "Open Selected" it enables batched opening without launching too many browser windows at once
+
+#### 🎫 Card-Key / Credential Parsing (Boundary-Char Fix)
+
+- **Fix**: 🔥 **Card-key import verification 401 (Bad credentials)** — RefreshToken / ClientSecret are base64url(JWT); when a field value ends with `-`, it abuts the `----` separator forming 5+ consecutive `-`. The old `split('----')` consumed only the first 4, dropping ClientSecret's trailing `-` (corrupting the JWT) and turning provider into `-BuilderId` → authMethod mis-detected as social → refresh hit the wrong endpoint and returned 401
+- **New**: Unified parser `splitCredentialLine` — matches separators with `/-{4,}/` and returns the extra (N-4) `-` to the previous field, keeping the JWT intact and provider correct; applied to OIDC batch import, TXT file card-key import, and Outlook mailbox parsing
+- **Fix**: TXT file card-key import previously hardcoded `idp=BuilderId` and ignored the 6th field — now reads the login method and infers from ClientId / Secret, consistent with the dialog batch-import logic
+
+#### 🗂️ Add / Batch / Import · Group Assignment
+
+- **New**: The Add Account dialog gains an "Add to group" dropdown at the top — covering login / OIDC single / OIDC batch / SSO; on open it defaults to the "currently opened group", and can be changed to any group or "Default (Ungrouped)"
+- **New**: File import (CSV / TXT / card-key) goes into the "currently opened group", with the group name shown in the completion toast; JSON full-backup import preserves the original group structure
+- **Fix**: Adding an account previously hardcoded `groupId: undefined`, sending new accounts to "Ungrouped" forever — now they are categorized by the selected group
+
+
+### v1.7.1 (2026-6-1) — Proton OTP Stability / Speed + Social Login Card-Key Fix
+
+> This release focuses on Proton-based registration OTP auto-retrieval (accuracy + speed + log visibility), the Proton login-state & proxy experience, and card-key import/export fixes for GitHub/Google social-login accounts.
+
+#### 📧 Proton OTP Auto-Retrieval (Registration)
+
+- **Fix**: OTP retrieval mis-clicked the inline star button — symptom was "mail arrived but it kept toggling star / couldn't read the code". Now precisely clicks the subject text (avoiding button / checkbox) to open the mail
+- **Fix**: OTP interfered with by other mails — AWS's concurrent "Response Required: Your Kiro Account" (same recipient, no code) pushed the real OTP mail into second place. Now filters by sender `no-reply@signin.aws` and reads the top two candidates, avoiding the "opened current mail but no code" deadlock
+- **New**: Exact recipient match — uses the mail-header recipient (dots preserved) to distinguish stale OTPs from other dot-variants of the same base address, preventing old codes
+- **Optimize**: OTP speed — replaced the fixed 2.2s sleep after opening a mail with poll-until-ready (continues once a 6-digit code / recipient+body are present, typically ~0.5s); since Proton OTP is local DOM polling with no rate-limit concern, the polling interval was tightened from the inherited 3s to ≤1s. Code-arrival → read latency drops from ~4s to ~1.5s
+- **New**: Full OTP-retrieval logs piped into the registration page log panel — sender filtering, exact recipient match, "latest mail recipient mismatch, waiting" states now visible in real time
+
+#### 🔐 Proton Login State + Proxy
+
+- **Fix**: Proton login state reverted to "not logged in" after switching pages and back — now uses a module-level cache to persist the login display across component unmount/remount
+- **Optimize**: Proton OTP window now defaults to the "Settings global proxy" (`process.env.HTTPS_PROXY`) instead of the system proxy or the registration proxy pool; the session proxy is also refreshed on window reuse, so proxy changes take effect on the next retrieval
+
+#### 🎫 Card-Key Import / Export (Social Login Fix)
+
+- **Fix**: 🔥 **GitHub / Google social-login card-key batch import failed** — the old logic hardcoded `provider=BuilderId`(IdC) on import, but social accounts have no ClientId / Secret and were rejected by the verify endpoint's `authMethod !== 'social' && (!clientId || !clientSecret)` guard ("please fill in Client ID and Client Secret")
+- **New**: Card-key export adds a **6th field "login method (idp)"** — `email----password----RefreshToken----ClientId----ClientSecret----loginMethod`, so import can accurately restore social(Github/Google) / IdC(BuilderId/Enterprise)
+- **New**: Backward-compatible with legacy 5-field card keys — when the 6th field is absent, the provider is inferred from ClientId / Secret presence: both empty → social (default Google), present → IdC (BuilderId). Social refresh only needs the RefreshToken, so inference passes verification
+
+
+### v1.7.0 (2026-5-28) — Security Hardening + Major Feature Expansion
+
+> This release packs 70+ improvements covering reverse-proxy security hardening, batch registration concurrency isolation, SOCKS proxy support, unified task center, webhook notifications, analytics reporting, one-click diagnostics, config import/export, and major performance optimizations.
+
+#### 🛡️ Reverse-Proxy Security Hardening (21 fixes)
+
+**P0 Critical Security**
+- **Fix**: `readBody` now enforces a max body size (default 10MB), rejects oversized Content-Length early + breaks connection on stream overflow → HTTP 413 (DoS protection)
+- **Fix**: Refuse to start when `host=0.0.0.0`/`::` without any API Key; red banner in UI + explicit `allowExternalWithoutApiKey` flag required to bypass
+- **Fix**: API Key comparison now uses `crypto.timingSafeEqual` to prevent timing-attack key guessing
+- **Fix**: 5xx responses return generic "Internal server error"; auto-sanitize Bearer/access_token/JWT/system paths
+- **Fix**: `/admin/config` GET masks `apiKeys[].key` plaintext, showing only `xxxx***last4`
+
+**P1 Operations & Observability**
+- **New**: IP allowlist / denylist (single IP + IPv4/IPv6 CIDR)
+- **New**: Critical proxy events trigger webhooks (account suspended / all accounts exhausted, with 5-min dedup)
+- **New**: `/admin/config` POST field allowlist, blocks remote mutation of port/host/apiKeys/tls
+- **New**: Per-API-Key / per-IP request rate limit (sliding window, configurable)
+- **New**: Session affinity (route same `conversation_id` to same account → preserve prompt cache + anti-risk-control)
+- **New**: keep-alive / headers idle timeout (default 65s/60s, configurable)
+- **New**: One-click TLS self-signed certificate generation (2-year validity + SAN covers localhost/127.0.0.1/::1/user host)
+- **New**: Graceful `stop()` (5s grace period → activeRequests.abort → socket.destroy)
+- **New**: Log sanitization (removes Bearer/access_token/JWT/system path fragments)
+
+**P2 Advanced**
+- **New**: Prometheus `/metrics` endpoint (8 core metrics: requests/tokens/credits/accounts/uptime)
+- **New**: Proxy audit log (rolling 200 entries + `/admin/audit` GET + `enableAuditLog` toggle)
+- **New**: API Key → Account allowlist (`apiKeyAccountBindings`: apiKey id → allowed account id array)
+- **New**: HTTP + HTTPS dual-port (with TLS enabled, listen HTTP on `fallbackPort` simultaneously)
+- **New**: Configurable `recentRequests` limit (default 100, max 10000)
+- **New**: Mark restart required on port/host/tls changes + one-click restart button in UI
+- **New**: Stream response socket-level backpressure monitoring
+
+**New files**: `src/main/proxy/selfSignedCert.ts`, `ProxySecurityPanel.tsx`
+**New IPC**: `proxySelfSignedCertInfo` / `proxySelfSignedCertRegenerate` / `proxyNeedsRestart` / `proxyRestart` / `proxyAuditLog` / `onProxyWebhookTrigger`
+
+#### 🌐 Multi-Protocol Proxy Support
+
+- **New**: SOCKS5 / SOCKS5h / SOCKS4 / SOCKS4a proxy support (via `socks` library + undici custom Agent + TLS upgrade)
+- **New**: Account-Proxy N:1 binding (reverse-proxy bucketing, multiple accounts share single IP to reduce risk-control correlation)
+- **New**: All account requests (token refresh, background check, Kiro API) go through bound proxy
+- **New**: Advanced proxy pool search (9-field full-text: host / port / protocol / user / label / email / url / tags / source)
+- **New**: Multi-dimensional filtering (protocol / enabled status / latency range / last validation time) with live match count
+
+#### 🚀 Batch Registration Major Upgrade
+
+**Concurrency Isolation Fixes**
+- **Fix**: Outlook concurrent email contention (frontend pre-shuffles outlookData + each task takes one line exclusively; main process compatible with single/multi-line)
+- **Fix**: Mixed mode source selection only effective once (each task independently calls `buildAutoConfig`, weight rotation now actually works)
+- **Fix**: Registration history "Direct connection" false report (`resolvedProxyUrl()` now includes system/env proxies)
+
+**Feature Expansion**
+- **New**: Rate limiter (token bucket) + exponential backoff + success rate monitoring
+- **New**: Failure retry queue (by error type: network / otp_timeout / email_used / rate_limit / auth / risk_control)
+- **New**: Auto-detect AWS risk control ("TEMPORARILY_SUSPENDED" / "please try again later") + auto-pause batch
+- **New**: Email pre-validation blacklist (auto-add used emails, skip to save time)
+- **New**: Mixed email source weighted round-robin (SWRR algorithm, same as nginx)
+- **New**: Daily registration quota + cron-style scheduled launch
+- **New**: Registration strategy templates (save/apply/import/export)
+- **New**: Dynamic 6-8 step progress bar (auto-adjusts based on `batchAutoImport` and `autoFetchProLink`)
+- **Fix**: Chinese mojibake errors during registration (tlsclientwrapper Latin-1 → UTF-8 re-decoding)
+- **Remove**: MoEmail registration mode (no longer useful)
+
+#### 📊 Task Center + Webhooks
+
+- **New**: Unified task center (`useTaskStore`, titlebar entry + drawer UI)
+- **New**: Task state machine: running / paused / success / failed / cancelled
+- **New**: Persisted finished tasks (saved to localStorage)
+- **New**: Cancel All button / progress bars / sub-task details
+- **New**: Webhooks (DingTalk / Telegram / Discord / Slack / Generic JSON)
+- **New**: Webhook retry (3 attempts with exponential backoff) + rate limit (20 msg/min/webhook)
+- **New**: Critical proxy events → Webhook (suspended / all exhausted)
+
+#### 🩺 One-Click Diagnostics
+
+- **New**: Diagnostics page (network / Kiro API / email service / proxy / custom endpoint connectivity)
+- **New**: Custom probe URL (replaces MoEmail field; any HTTP/HTTPS endpoint accepted)
+- **New**: Run diagnostics through proxy + report export (clipboard)
+- **New**: Auto-migrate legacy MoEmail config to new probe URL key
+
+#### 🔧 Subscription Management
+
+- **New**: Bulk subscription pre-flight check (eligibility + report)
+- **New**: Cancel / downgrade / renew entries
+- **New**: Subscription link expiry detection (HTTP HEAD probe + generatedAt timestamp)
+- **New**: Manage Subscriptions tab (bulk open portal + one-click disable overage)
+- **New**: Subscribed accounts virtual list (@tanstack/react-virtual)
+
+#### 📈 Analytics Reports
+
+- **New**: Registration analytics report (success/fail donut + 24h smooth curve + 7-day trend)
+- **New**: Error classification stats (OTP timeout / network / email used / rate limit / risk control)
+- **New**: CSV export
+
+#### 📦 Config Import / Export
+
+- **New**: One-click full config export (accounts / proxies / webhooks / strategy templates)
+- **New**: AES-GCM encrypted export (KCFG format, PBKDF2-SHA256 key derivation)
+- **New**: Cross-device config sync
+
+#### ⚡ Performance Optimization (Anti-Lag)
+
+**I/O & Persistence**
+- **Optimize**: `saveToStorage` 500ms debounce + `flushSaveImmediately` force-flush API
+- **Optimize**: `createBackup` 5-minute throttle (previously backed up on every save)
+- **Optimize**: `ProxyLogStore` async `fs.promises.writeFile` + 30s throttle + maxLogs 1M → 50K
+- **Optimize**: `proxy-account-suspended` IPC updates memory snapshot only, deferred disk write
+- **Optimize**: SSO accounts `queueMicrotask` async loading (no longer blocks loadFromStorage)
+
+**Render & Compute**
+- **Optimize**: `getFilteredAccounts` / `getStats` / `activeAccount` module-level memoization
+- **Optimize**: `applyBackgroundRefreshResults` / `applyBackgroundCheckResults` batch merge (120ms buffer)
+- **Optimize**: `importAccounts` / `importFromExportData` single set call
+- **Optimize**: `updateTrayInfo` 400ms debounce
+- **Optimize**: `AccountToolbar` selection status with `useMemo` + `useCallback`
+- **Optimize**: Proxy pool / accounts / subscriptions use virtual list (`@tanstack/react-virtual`, only render visible area)
+
+#### 🐛 Critical Bug Fixes
+
+- **Fix**: `Invalid URL protocol` (Windows registry ProxyServer multi-protocol string parsing, take only HTTP/HTTPS)
+- **Fix**: `tls-client-wrapper` DLL moved to `userData/tls-client/` for permanent storage (was in `%TEMP%`, could be cleaned by system)
+- **Fix**: Network response Latin-1 → UTF-8 conversion (Chinese errors display correctly)
+- **Fix**: `proxyServer.stop()` socket force-destroy was too early, truncating responses
+- **Fix**: Memory leaks (rate limit buckets / session affinity entries auto-cleaned every 5 min)
+
+#### 🆕 New Pages
+
+- **`ProxyPoolPage`** — Proxy pool management + advanced search + account binding + scheduled validation
+- **`WebhooksPage`** — Webhook configuration + testing + event subscription
+- **`DiagnosePage`** — One-click diagnostics (network / API / email / proxy / custom)
+- **`ConfigSyncPage`** — Config import/export + AES-GCM encryption
+
+#### 🔧 Theme & UI
+
+- **New**: Task center button (titlebar) + global progress display
+- **New**: Reverse-proxy "Security & Observability (v1.8)" card (collapsible, unified entry for new settings)
+- **Improve**: Failure error code localized display
+- **Improve**: Dangerous binding (0.0.0.0) auto-show red warning + risk confirmation toggle
+
+#### 🔄 ProxyAccount Data Model Extension
+
+- New `proxyUrl` field (account-bound egress proxy)
+- New `machineId` field (account-bound device ID)
+
+#### 📋 New ProxyConfig fields (14 items)
+
+`maxRequestBodyBytes` / `allowedIPs` / `deniedIPs` / `allowExternalWithoutApiKey` / `rateLimitPerKeyPerMinute` / `sessionAffinityEnabled` / `keepAliveTimeoutMs` / `headersTimeoutMs` / `recentRequestsLimit` / `enableMetrics` / `apiKeyAccountBindings` / `fallbackPort` / `enableAuditLog` / `apiKeyGroupBindings`(deprecated)
+
+
+### v1.6.9 (2026-5-24)
+
+#### Full Theme Adaptation
+- **Refactor**: All dialog/card hardcoded colors replaced with theme/semantic tokens — `text-green-500/600` → `text-success`, `text-red-500/600` → `text-destructive`, `text-amber/orange-500/600` → `text-warning`, decorative `bg-blue-50/...` → `bg-primary/[0.04~0.15]`
+- **Scope**: AccountDetailDialog, AccountCard, AccountListRow, ModelsDialog, AccountSelectDialog, ProxyLogsDialog, ProxyDetailedLogsDialog, ApiKeyUsageDialog, ClientConfigDialog, EditAccountDialog, SteeringEditor, AddAccountDialog, ApiKeyManager, ProxyPanel — 14+ components
+- **Refactor**: `_helpers.ts` `getStatusBadgeClass` status colors fully tokenized with auto dark mode support
+- **Optimization**: All dialogs/cards now instantly follow theme color changes — no more "some elements don't update on theme switch"
+
+#### Account Card Solid Background
+- **New**: `--card-solid` CSS variable (light `#FFFFFF` / dark `#1A2236`) — dedicated opaque background for account cards
+- **New**: `.bg-solid-card` utility class with dual-class selector (`.glass-card.bg-solid-card`) to override glass-card transparent background and disable `backdrop-filter`
+- **Fixed**: Theme color (e.g. orange) bleeding through 72% transparent `bg-card` into account data area causing "tinted overlay" effect
+- **Preserved**: Other glass elements (dialog/popover/toolbar/sidebar/KIRO quota cards) retain `bg-card` transparency
+
+#### List/Card View Visual Improvements
+- **Refactor**: Tag chips changed from solid fill to translucent outlined style (12% tag color background + tag color text + 30% tag color border), more subtle
+- **Refactor**: `generateRowGlowStyle` single-tag case removes horizontal background gradient, keeping only left 3px color stripe; multi-tag keeps vertical gradient stripe
+- **Fixed**: Card/list row selection state overridden by multi-tag inline style (`box-shadow`/`background`) causing no visual feedback — switched to absolutely positioned overlay layer (`absolute inset-0 ring-2 ring-inset ring-primary/60 bg-primary/[0.08] z-10`) isolated from inline style
+- **Optimization**: Selection state enhanced to `ring-2 ring-primary/60` + `bg-primary/[0.08]` + primary shadow
+
+#### Group Management Refactor (Independent View Mode)
+- **New**: `useAccountsStore` added `activeGroupTab` state (`'all' | 'ungrouped' | <groupId>`) with localStorage persistence — replaces multi-select filter logic
+- **New**: `getFilteredAccounts()` filters by `activeGroupTab` first (mutually exclusive)
+- **Refactor**: Toolbar "Group" button now a 3-in-1 menu — Switch View / Bulk Move / Manage Groups
+  - Button text dynamically shows current tab name + color dot + count
+  - Dropdown menu uses 2-column compact grid to save vertical space
+  - User groups listed once (merged switch and bulk move zones)
+  - When accounts are selected, hovering a tile reveals end-of-row ⇄ button to bulk move
+- **Removed**: AccountFilter group chip multi-select zone (eliminates dual-control conflict with tabs)
+- **Fixed**: Dropdown menu obscured by cards — `<header>` got `relative z-20` to elevate stacking context (`.glass-toolbar`'s backdrop-filter creates isolated z layer)
+
+#### Account Toolbar Compactness
+- **Refactor**: 6 toolbar buttons (tags/privacy/filter/check/delete/refresh) changed to icon-only + tooltip mode (`size="icon" h-8 w-8`), saving ~280px width
+- **Optimization**: Tags button selected state uses primary color dot (6px) instead of `ChevronDown`, more restrained
+- **Optimization**: Delete button hover turns `bg-destructive/10` red as warning
+- **Optimization**: Tooltips dynamically show selected count (e.g. "Delete 5 selected accounts"), disabled state hints "select first"
+- **New**: Standalone "Clear Selection" X button (only shown when selected), red hover hint
+- **Preserved**: Group button (with current tab name) + Select All button (with count) keep text for information value
+
+#### Pro Plan Customization in Registration Page
+- **New**: `ProPlanType` type — Pro / Pro+ / Power, mapped to Kiro backend `Q_DEVELOPER_STANDALONE_{PRO|PRO_PLUS|POWER}` qSubscriptionType
+- **New**: 3-choice chip buttons (blue/purple/gold business colors) added below "Auto-fetch Pro subscription link" toggle, localStorage persistent
+- **Refactor**: `fetchProSubscriptionUrl` uses user-selected plan type instead of hardcoded PRO
+
+#### Proxy Server Enhancements
+- **Fixed**: Multi-account mode "expired token accounts never refreshed" bug — `accountPool.isAccountAvailable` only marks accounts unavailable when `refreshToken` is missing; expired accounts with refreshToken pass through to `proxyServer.getAvailableAccount` for refresh; refresh failures auto-isolated via `markNeedsRefresh` forming a closed loop
+- **New**: `ProxyConfig` added `multiAccountSelectionMode: 'all' | 'groups'` and `multiAccountGroupIds: string[]` fields
+- **New**: Multi-account rotation added "Scope" config — All Accounts / Specific Groups (chip multi-select including "Ungrouped" special option)
+- **New**: `syncAccounts` filters accounts by selected groups in multi-account + groups mode
+- **New**: Proxy panel UI added "Scope" toggle + group chips (user group colors + counts) + real-time account count preview
+- **Sync**: Preload IPC types synced (`multiAccountSelectionMode` / `multiAccountGroupIds` / `accountSelectionStrategy`)
+
+#### Proxy Panel UI Compactness
+- **Refactor**: Basic config + API Key merged into 1 row 12-column grid — Port(2) + Host(3) + API Key(7)
+- **Refactor**: API Key operation buttons (sk-xxx format selector / random generate / copy / manage) all `icon-only h-7 w-7` moved to Label row right side
+- **Refactor**: Advanced settings changed from 2 to 3 columns, all description `<p>` tags moved to Label `title` tooltip (saves 30-40% vertical space)
+- **Refactor**: Token Buffer toggle + number input merged into `col-span-3` row (`[Auto-trim toggle 160px][Number input flex-1]`)
+- **Optimization**: Mode toggle row changed from `flex-wrap` to `grid-cols-3`, 3 toggles (auto-switch/log requests/stream events) on one row
+- **Fixed**: `sk-xxx` dropdown `h-6` clipped by Select's internal `py-2` — used Tailwind arbitrary attribute selector `[&>button]:h-7 [&>button]:py-0 [&>button]:px-2.5` to force override
+- **Optimization**: Advanced settings header added `Settings2` icon + `uppercase tracking-wider` minimalized
+
+#### Bug Fixes
+- **Fixed**: `AccountManager.tsx` trailing extra `}` causing TypeScript syntax error
+- **Optimization**: `AccountFilter.tsx` cleaned up unused `groups` destructuring
+
+### v1.6.8 (2026-5-23)
+
+#### Token Counting Precision Refactor
+- **New**: Standalone `tokenCounter.ts` module — encapsulates `js-tiktoken` `cl100k_base` encoder and `getModelContextLength` function, unifying all token computation logic
+- **New**: Multi-tier precision chain — Kiro backend `tokenUsage` real value > `contextUsageEvent` percentage reverse calculation (`modelCtx × percentage / 100`) > `tiktoken` precise count > character-based fallback (input 0.42, output 0.4)
+- **Optimization**: Input token estimation error reduced from ~30% to ~5% (Sonnet 4.5 measured 17871 → 19608, perfectly aligned with official 12.7% contextUsage)
+- **Optimization**: Output token statistics now accumulate `assistantResponseEvent` / `codeEvent` text and apply tiktoken, no longer relying on character length
+- **New**: `getModelContextLength` 3-tier lookup chain — Kiro `fetchKiroModels`'s real `maxInputTokens` cache first → fuzzy match (`claude-sonnet-4.5` ↔ `claude-sonnet-4-5-20251001`) → keyword fallback (sonnet/haiku/opus/gpt-4 etc.)
+- **New**: AmazonQ CLI endpoint `CodeEvent` parsing support — fixes lost streaming code content on this endpoint
+- **Optimization**: `parseEventStream` signature extended with `modelId` and `payloadStr` parameters for end-to-end model context propagation enabling contextUsage reverse calculation
+- **Fixed**: Removed duplicate `modelContextWindowCache` definition in `kiroApi.ts`; unified import and re-export from `tokenCounter.ts` for backward compatibility
+
+#### Token Buffer Reserve Toggle (Off by Default)
+- **Changed**: ⚠️ **`tokenBufferReserve` behavior change** — v1.6.7 force-enabled 50K reserve; v1.6.8 makes it an opt-in toggle, **off by default**, default value lowered to 20K when enabled
+- **New**: `enableTokenBufferReserve` standalone switch — new field in `ProxyConfig`, frontend UI adds inline Switch control
+- **Behavior**: When off, `trimHistoryByTokens` is **completely skipped**; `CONTENT_LENGTH_EXCEEDS_THRESHOLD` from Kiro backend is forwarded as-is to the client
+- **Behavior**: When on, effective limit = `model.maxInputTokens - tokenBufferReserve` (200K → 180K, 1M → 980K, range 5K~150K)
+- **UI**: Number input `disable` condition extended with `!enableTokenBufferReserve` — input auto-greys when switch off; all related controls locked while server is running
+- **Compat**: Existing 50K values in stored config are preserved (still in 5K~150K range), but won't trigger trimming because the switch is off by default; users must manually enable
+
+#### Proxy URL Tolerance
+- **New**: `normalizeProxyUrl` utility — auto-normalizes user-input non-standard proxy URLs (e.g. `http:127.0.0.1:7890` missing `//`, `127.0.0.1:7890` missing scheme, leading/trailing whitespace) into standard `http://host:port` format
+- **Optimization**: Environment variables (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`), Electron `session.setProxy`, and frontend UI now consistently use the normalized URL, avoiding proxy failure or duplicate setup
+- **Optimization**: IPC `set-proxy` returns `normalizedUrl` to frontend store, auto-writing back to UI input for visual confirmation
+
+#### Feature Trim
+- **Removed**: "Auto Continue Rounds / Server-side tool auto continue" full feature chain — 14 references cleared (frontend UI controls, `ProxyConfig` fields, IPC `proxyStart`/`proxyUpdateConfig` type signatures, backend OpenAI `handleOpenAIStream` and Claude `handleClaudeStream` auto-continue branches)
+- **Behavior**: Stream tool calls now return `tool_calls` / `tool_use` directly to client after completion; client decides what to do next, no more server-side "fake continue" recursive call path
+- **Rationale**: This feature conflicted with mainstream API clients (Cline / Roo / Cursor / Claude Code) tool execution loops, and was mutually exclusive with the recommended `clientDrivenToolExecution=true` configuration; long unused
+
+#### Bug Fixes
+- **Fix**: 🔥 `electron-builder` build error `ENOENT: no such file or directory, rename 'electron.exe' -> 'kiro-account-manager.exe'` — root cause was incomplete `electron-v38.7.2-win32-x64.zip` download from npmmirror corrupting the Electron binary; switched to BITS download from `cdn.npmmirror.com/binaries/electron/` for full zip
+- **Fix**: Registration `app.js` download triggers `RangeError: init["status"] must be in the range of 200 to 599, inclusive.` — `tlsclientwrapper` returned `status=0/undefined` on network errors, triggering `new Response()` validation exception. Switched to `undici fetch` for static resources to bypass tls-client and avoid polluting its global state
+- **Fix**: OIDC registration fails with `failed to build client out of request input: failed to modify existing client: no tls client for modification check` when proxy enabled — `app.js` download failure polluted the tls-client DLL global state, causing subsequent `SessionClient` initialization to fail. Auto-resolved by the `app.js` undici fix above
+- **Fix**: Frontend `setProxy` changed to async function — awaits normalized URL from IPC and writes back to store for display, preventing UI/effective value mismatch
+
+### v1.6.7 (2026-5-23)
+
+#### Account Suspension Handling (NEW)
+- **New**: Full TEMPORARILY_SUSPENDED detection pipeline — proxy server now recognizes Kiro backend risk-control errors (`403 + reason:"TEMPORARILY_SUSPENDED"`), `AccountSuspendedException` (CodeWhisperer), and `423 Locked` responses
+- **New**: `ProxyAccount` gains `suspendedAt` / `suspendReason` / `suspendMessage` fields to track long-term bans (distinct from temporary `errorCount` cooldown)
+- **New**: `AccountPool` adds `isSuspended` / `markSuspended` / `clearSuspended` — suspended accounts are permanently skipped in `isAccountAvailable` until manually cleared or `reset()`
+- **New**: `onAccountSuspended` event + IPC `proxy-account-suspended` — full bridge from proxy server → main → preload → renderer store → UI
+- **New**: Suspension state persisted to `store.accountData[id].lastError` and `status='error'` — survives app restart
+- **New**: Auto-switch to next available account when current is suspended (works in both multi-account and single-account+auto-switch modes)
+- **Improved**: Unified `isBannedAccountError` across `store/accounts.ts` / `AccountSelectDialog` / `AccountCard` — all three now recognize `temporarily_suspended` / `temporarily suspended` / `User ID is suspended` patterns and display the ban banner
+- **New**: Manual unsuspend UI — `AccountCard` ban-detail dialog now has a `Reset Suspended` button that calls IPC `proxy-clear-account-suspended` → clears `accountPool` suspended flag + wipes `store.accountData[id].lastError` + sets `status='active'`
+- **Fixed**: `accountPool.addAccount` previously always forced `isAvailable=true`, which would silently wipe out the suspended state if an account was re-added (e.g., after `proxy-sync-accounts`). Now `addAccount` respects the incoming `suspendedAt` field and preserves `isAvailable=false`, so suspended accounts re-added from persisted data stay correctly skipped.
+
+#### LAN Access Fix (Issue #75)
+- **Fixed**: 🔥 **Cannot access proxy via LAN after upgrading from 1.5.0 to 1.6.x** — root cause: default `host` was `127.0.0.1` (loopback only) and the UI "Public" toggle was `disabled` while the server was running, so users couldn't switch without stopping the service
+- **Fixed**: "Public" switch in Proxy Panel is now clickable even while the server is running — toggling automatically stops + starts the proxy to apply the new host binding within ~300ms
+- **Improved**: Service address now displays `http://localhost:5580` instead of `http://0.0.0.0:5580` (the latter is not a valid client target); copy-address button uses the same human-readable form
+- **Improved**: Inline hints below the host field — loopback mode tells users how to enable LAN access; public mode warns to set an API Key and allow the port through the firewall
+- **Improved**: When public mode is active, a secondary tip below the service address shows `LAN devices use http://<this-machine-IP>:<port>`
+
+#### UI Improvements
+- **New**: 🎨 **Premium SaaS Glassmorphism Redesign** — full design system overhaul inspired by Linear / Raycast / Vercel:
+  - **Design tokens**: background `#f4f7fb`, primary `#5B8CFF`, violet accent `#8B5CF6`, success `#22C55E`, translucent white borders `rgba(255,255,255,0.4)`
+  - **Frosted glass system**: new `.glass-card` / `.glass-card-strong` / `.glass-card-subtle` / `.glass-sidebar` / `.glass-toolbar` utility classes with `backdrop-filter: blur(24px) saturate(180%)`
+  - **Floating sidebar**: Sidebar now floats with `rounded-3xl` (24px), glass backdrop, framer-motion spring width animation, layoutId-based active pill morph (primary → violet gradient)
+  - **Ambient light background**: dual radial gradients (blue + violet) animated with 22s/26s float keyframes — soft 80px blur, auto-dimmed in dark mode
+  - **Card defaults**: `<Card>` now defaults to glass variant with `rounded-2xl` (24px), supports `variant=glass/glass-strong/glass-subtle/solid/elevated` and `interactive` prop for hover-lift animation (translateY -2px + enhanced shadow)
+  - **Page hero unification**: all 8 pages (Home / Accounts / Settings / Proxy / KProxy / KiroSettings / Subscription / Register / About / MachineId) now use `.page-hero` class with consistent 24px rounded glass header
+  - **Transparent toolbars**: AccountManager header uses `glass-toolbar` (16px blur + subtle bg + border-bottom only)
+  - **Page transitions**: `AnimatePresence` + `motion.div` wraps page content with fade + 8px Y-axis spring transition on route change
+  - **Dark mode**: deep navy `#0a0e1a` background with glass surfaces tuned for low-light readability
+  - **Dependencies**: added `framer-motion ^11.x` for declarative animations
+- **Fixed (Glassmorphism polish)**: page scroll regression — `motion.div` wrapper now uses `h-full flex flex-col` so child page's `flex-1 overflow-auto` works correctly
+- **Improved (Glassmorphism polish)**:
+  - All 33 instances of `<Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">` across `HomePage` / `SettingsPage` / `AboutPage` / `RegisterPage` / `KiroSettingsPage` / `ProxyPanel` replaced with `hover-lift` — default glass variant now fully visible
+  - 4 hand-rolled Dialog containers (`UpdateDialog` / `CloseConfirmDialog` / `AccountDetailDialog` / `ProxyDetailedLogsDialog`) switched from `bg-background rounded-xl border` to `glass-card-strong rounded-2xl` + backdrop-blur overlay
+  - `Button` component reworked: `rounded-xl` default, `transition-all 200ms`, hover `-translate-y-px` + ring-color glow on `default`/`destructive` variants, new `gradient` variant (theme-aware `gradient-bg-primary` + `breathe-glow` animation), new `cta` size (h-12 rounded-2xl) for primary call-to-actions
+  - **All 21 themes now have theme-aware active-pill gradient** — each theme defines `--gradient-from` / `--gradient-to` pair (purple/emerald/orange/rose/cyan/amber/teal/indigo/lime/pink/slate/zinc/sky/violet/fuchsia/red/yellow/green/stone/neutral + default). Sidebar's `motion.span layoutId="sidebar-active-pill"` reads from CSS vars, so the active menu pill morphs through the selected theme's hue gradient (e.g., emerald theme → teal-green gradient instead of fixed blue→violet)
+  - `gradient-bg-primary` and `gradient-border` utility classes now use `var(--gradient-from/-to)` so all gradient buttons/borders follow theme selection automatically
+- **Improved (Glass refinement)**:
+  - **Glass shadow upgrade**: 4-layer composite shadow — top hairline highlight (inset 1px white), micro outer stroke (1px slate-900 @ 4%), far ambient (0 8px 32px @ 12%), near contact (0 2px 6px @ 5%) — gives cards real "frosted acrylic" presence on light backgrounds where pure translucency was invisible
+  - **Page surface ambient**: `main` container now has `.page-surface` (dual blue/violet radial blobs @ 18% / 14% opacity, 60px blur) so glass cards have actual color to refract through — previously cards looked solid white on solid white background
+  - **AccountCard refactor**: removed stray `border` + `hover:shadow-lg` overrides that were stomping the glass system; now uses `hover-lift` utility (translateY -2px + enhanced shadow) on non-active/non-banned cards; active glow border and banned red border preserved
+  - **AccountToolbar inputs**: search box and view-mode toggle now use `bg-[var(--glass-bg-subtle)] backdrop-blur-md` with rounded-xl + larger focus ring; filter panel number inputs (`AccountFilter`) same treatment
+- **New**: Accounts page now supports **List view** in addition to the existing card grid — toolbar gains a Grid/List toggle, persists to `localStorage('accounts_viewMode')`. Compact list rows show inline email + status + subscription + tags + credit progress + key actions, with ~5x density vs cards (good for managing 100+ accounts)
+- **Fixed**: System Logs page `displayLimit` default changed from `All` to `5K` and now persists to `localStorage('systemLogs_displayLimit')` — previously the value reset to `All` on every page navigation/app restart, hurting initial render performance with large log volumes
+
+#### Token-Based History Trimming
+- **New**: `tokenBufferReserve` setting (replaces previous `maxInputTokensThreshold`) — adaptive history trimming based on the actual model's `contextWindow` returned by `ListAvailableModels`
+- **Changed**: Effective trim threshold computed as `model.maxInputTokens - tokenBufferReserve` per request — default `50000` reserve fits all models (200K models → 150K cutoff, 1M models → 950K cutoff)
+- **New**: Reserve accounts for `system` + `tools` + current message + output budget + estimation skew, preventing `CONTENT_LENGTH_EXCEEDS_THRESHOLD` on long conversations regardless of byte-based payload size
+- **New**: Model context cache synced from `fetchKiroModels` into the trimming logic so newly added Kiro models pick up correct limits automatically
+
+#### Dialog Glassmorphism Refactor
+- **Refactored**: 17 dialogs unified under `.glass-card-strong` — rewritten as 90% translucent white (`rgba(255,255,255,0.90)` / dark `rgba(20,25,40,0.90)`) + `backdrop-filter: blur(20px) saturate(160%)` real frosted glass + 3-layer composite deep shadow (1px outer border + 0 24px 64px far shadow + 0 8px 24px near contact shadow) for strong elevation
+- **Unified**: dialog overlays standardized from `bg-black/40 backdrop-blur-sm` / `bg-black/50` to `bg-slate-900/[0.12] dark:bg-black/50 backdrop-blur-xl` — light-mode 12% slate ultra-faint mask + heavy blur (24px) so background blurs without graying out the dialog sample
+- **Unified**: all dialog close buttons (×) now use red hover — `hover:bg-red-500 hover:text-white transition-colors`, covering `AccountDetailDialog` / `EditAccountDialog` / `AddAccountDialog` / `TagManageDialog` / `GroupManageDialog` / `ExportDialog` / `AccountCard` ban+subscription / `ApiKeyUsageDialog` / `AccountSelectDialog` / `UpdateDialog` (15+ dialogs total), matching TitleBar close button for consistent danger semantics
+- **Improved**: `--glass-bg-strong` token changed from opaque white to 90% translucent + `backdrop-filter` now actually applies, so dialogs are no longer flat opaque cards but true glass panels
+
+#### Theme Base Color & Ambient Light Overhaul
+- **Design**: Light-mode background `#f4f7fb` → `#EEF2F8` icy blue (inspired by F1 Fresh Blue), reducing the dead-white "AI palette" feel
+- **Design**: Dark-mode background `#0a0e1a` → `#0B1220` deep navy (inspired by E1 Deep Space), shifted from neutral gray-black to blue tone
+- **New**: 3-stop body gradient — light mode `#E5EBF5` → `#EEF2F8` → `#F2F5FA` simulating daylight transition; dark mode `#0F1729` → `#0B1220` → `#060A14` for night-sky depth
+- **New**: body gradient top/bottom tinted via `color-mix(in srgb, var(--gradient-from) 10%, ...)` — **switching themes now changes the entire ambient background** (previously themes only affected buttons, not background atmosphere)
+- **Improved**: Ambient blobs changed from hardcoded `rgba(91,140,255,0.55)` blue/purple to `color-mix(var(--gradient-from) 38%, transparent)` — breathing glow follows the active theme hue, so blue/purple/green/orange/gold themes each have a distinct atmospheric tone
+- **Improved**: Titlebar light-mode glass updated from `rgba(255,255,255,0.75)→rgba(244,247,251,0.65)` to `rgba(255,255,255,0.78)→rgba(229,235,245,0.65)`; dark-mode from neutral dark-gray to deep navy `rgba(22,30,48,0.85)→rgba(11,18,32,0.75)`
+- **Fixed**: App root `<div>` had `bg-background` opaque class overriding the body gradient — now removed so the gradient is actually visible
+
+#### Theme Expansion — 11 Premium Themes Added (32 Total)
+- **New**: "Luxury" group (4) — `gold` `#C9A227` / `navy` `#1E40AF` / `wine` `#9F1239` / `champagne` `#B89968`, suited for finance, business, and luxury-brand contexts
+- **New**: "Morandi" group (4) — `dustyblue` `#64748B` / `terracotta` `#B45434` / `sage` `#6B8E5A` / `mauve` `#8E7CC3`, low-saturation premium grays for long-session eye comfort
+- **New**: "Natural" group (3) — `coral` `#F87171` / `forest` `#166534` / `ocean` `#155E75`, calm natural tones
+- **Improved**: Each new theme has matched dark-mode values (e.g., `forest` light `#166534` / dark `#4ADE80`) for WCAG contrast
+- **Synced**: `accounts.ts` theme-removal list includes the 11 new classes; `zh.ts` / `en.ts` / `AboutPage.tsx` updated from "21 themes" to "32 themes"
+
+#### Usage Stats Progress Bar Enhancement
+- **New**: Live percentage pill at progress bar top-right — color-graded by usage: < 50% green, 50-80% yellow, 80-100% orange, > 100% red
+- **New**: Over-quota dual-segment progress bar — base segment (0-100% filled, color-graded) + red striped overflow overlay on the right (`animate-pulse` + 45° `repeating-linear-gradient`), overflow visual width proportional to excess ratio (capped at 60% so base color remains visible)
+- **New**: Red warning banner appears below progress bar when over quota — shows "⚠️ Over Quota +X.XX%" + "Excess: Y credits" inside `bg-red-500/10` + `border-red-500/30` highlight area
+- **Improved**: Both percentage and over-quota ratio respect the `usagePrecision` setting (2 decimals when enabled, 1 when off)
+
 ### v1.6.6 (2026-5-17)
 
 #### E2E Test Suite

@@ -137,8 +137,32 @@ const api = {
     authMethod?: 'IdC' | 'social'
     provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
     profileArn?: string
-  }): Promise<{ success: boolean; error?: string }> => {
+    accountId?: string
+  }): Promise<{
+    success: boolean
+    error?: string
+    refreshedCredentials?: { accessToken: string; refreshToken: string; expiresIn: number }
+  }> => {
     return ipcRenderer.invoke('switch-account', credentials)
+  },
+
+  // 订阅 Kiro IDE 自己 refresh token 后反代检测到的事件
+  onKiroIdeTokenChanged: (callback: (data: { accountId: string; reason: string }) => void): (() => void) => {
+    const handler = (_event: unknown, data: { accountId: string; reason: string }): void => {
+      callback(data)
+    }
+    ipcRenderer.on('kiro-ide-token-changed', handler)
+    return (): void => {
+      ipcRenderer.removeListener('kiro-ide-token-changed', handler)
+    }
+  },
+
+  // 主动续期开关：开启后账号管理器会在 IDE refresh 阈值前抢先 refresh，IDE 永不自刷
+  setProactiveRenewalEnabled: (enabled: boolean): Promise<{ success: boolean; enabled?: boolean; error?: string }> => {
+    return ipcRenderer.invoke('set-proactive-renewal-enabled', enabled)
+  },
+  getProactiveRenewalEnabled: (): Promise<{ success: boolean; enabled: boolean; leadTimeMinutes?: number; error?: string }> => {
+    return ipcRenderer.invoke('get-proactive-renewal-enabled')
   },
 
   // 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
@@ -370,7 +394,7 @@ const api = {
   },
 
   // 代理设置
-  setProxy: (enabled: boolean, url: string): Promise<{ success: boolean; error?: string }> => {
+  setProxy: (enabled: boolean, url: string): Promise<{ success: boolean; error?: string; normalizedUrl?: string }> => {
     return ipcRenderer.invoke('set-proxy', enabled, url)
   },
 
@@ -589,7 +613,7 @@ const api = {
   // ============ Kiro API 反代服务器 ============
 
   // 启动反代服务器
-  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
+  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }): Promise<{ success: boolean; port?: number; error?: string }> => {
     return ipcRenderer.invoke('proxy-start', config)
   },
 
@@ -634,8 +658,44 @@ const api = {
   },
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; payloadSizeLimitKB?: number; autoSwitchOnQuotaExhausted?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think'; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }): Promise<{ success: boolean; config?: unknown; error?: string }> => {
+  proxyUpdateConfig: (config: Record<string, unknown>): Promise<{ success: boolean; config?: unknown; error?: string }> => {
     return ipcRenderer.invoke('proxy-update-config', config)
+  },
+
+  // ============ v1.8 反代安全 / 可观测 IPC ============
+
+  /** 获取反代自签证书信息（用于在 UI 显示指纹/有效期 + 让用户导出 .crt） */
+  proxySelfSignedCertInfo: (): Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-self-signed-cert-info')
+  },
+
+  /** 强制重新生成反代自签证书（重启 server 后生效） */
+  proxySelfSignedCertRegenerate: (): Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }> => {
+    return ipcRenderer.invoke('proxy-self-signed-cert-regenerate')
+  },
+
+  /** 查询是否需要重启反代（port/host/tls 变更后 UI 提示） */
+  proxyNeedsRestart: (): Promise<{ needsRestart: boolean }> => {
+    return ipcRenderer.invoke('proxy-needs-restart')
+  },
+
+  /** 立即重启反代 */
+  proxyRestart: (): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-restart')
+  },
+
+  /** 获取反代审计日志 */
+  proxyAuditLog: (): Promise<{ entries: Array<{ ts: number; type: string; data: Record<string, unknown> }> }> => {
+    return ipcRenderer.invoke('proxy-audit-log')
+  },
+
+  /** 监听 main 进程推送的 webhook 事件（关键告警） */
+  onProxyWebhookTrigger: (callback: (event: string, payload: Record<string, unknown>) => void): (() => void) => {
+    const handler = (_e: Electron.IpcRendererEvent, data: { event: string; payload: Record<string, unknown> }): void => {
+      callback(data.event, data.payload)
+    }
+    ipcRenderer.on('proxy-webhook-trigger', handler)
+    return () => ipcRenderer.off('proxy-webhook-trigger', handler)
   },
 
   // 添加账号到反代池
@@ -661,6 +721,11 @@ const api = {
   // 重置反代池状态
   proxyResetPool: (): Promise<{ success: boolean; error?: string }> => {
     return ipcRenderer.invoke('proxy-reset-pool')
+  },
+
+  // 手动解除账号封禁标记
+  proxyClearAccountSuspended: (accountId: string): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proxy-clear-account-suspended', accountId)
   },
 
   // 刷新模型缓存
@@ -753,6 +818,17 @@ const api = {
     ipcRenderer.on('proxy-status-change', handler)
     return () => {
       ipcRenderer.removeListener('proxy-status-change', handler)
+    }
+  },
+
+  // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
+  onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }): void => {
+      callback(info)
+    }
+    ipcRenderer.on('proxy-account-suspended', handler)
+    return () => {
+      ipcRenderer.removeListener('proxy-account-suspended', handler)
     }
   },
 
@@ -942,6 +1018,20 @@ const api = {
     }
   },
 
+  // ============ 自定义 titlebar API ============
+  window: {
+    minimize: (): void => ipcRenderer.send('window-minimize'),
+    maximizeToggle: (): void => ipcRenderer.send('window-maximize-toggle'),
+    close: (): void => ipcRenderer.send('window-close'),
+    isMaximized: (): Promise<boolean> => ipcRenderer.invoke('window-is-maximized'),
+    getPlatform: (): Promise<NodeJS.Platform> => ipcRenderer.invoke('window-get-platform'),
+    onMaximizeChange: (callback: (isMaximized: boolean) => void): (() => void) => {
+      const handler = (_event: any, isMaximized: boolean): void => callback(isMaximized)
+      ipcRenderer.on('window-maximize-changed', handler)
+      return () => ipcRenderer.removeListener('window-maximize-changed', handler)
+    }
+  },
+
   // ============ 托盘相关 API ============
 
   // 获取显示主窗口快捷键
@@ -1052,6 +1142,8 @@ const api = {
   // 启动自动注册
   registrationStartAuto: (config: {
     proxy?: string
+    upstreamProxy?: string
+    strictProxy?: boolean
     moEmailBaseURL?: string
     moEmailAPIKey?: string
     useOutlook?: boolean
@@ -1060,6 +1152,8 @@ const api = {
     tempMailPlusEmail?: string
     tempMailPlusEpin?: string
     tempMailPlusDomain?: string
+    useProton?: boolean
+    protonEmail?: string
     password?: string
     fullName?: string
     taskId?: string
@@ -1091,9 +1185,117 @@ const api = {
     return ipcRenderer.invoke('registration-cancel')
   },
 
+  // ============ 代理池 API ============
+  /**
+   * 验活单个代理：使用 undici ProxyAgent 通过指定代理 URL 请求测试 URL
+   * @returns latencyMs / externalIp（如果测试 URL 返回 IP）
+   */
+  proxyPoolValidate: (params: {
+    url: string
+    testUrl?: string
+    timeoutMs?: number
+    upstreamProxy?: string
+  }): Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }> => {
+    return ipcRenderer.invoke('proxy-pool:validate', params)
+  },
+
+  /** 代理链分阶段诊断（用于定位"上游/目标/端到端"哪一层失败） */
+  proxyPoolDiagnoseChain: (params: {
+    targetUrl: string
+    upstreamProxy: string
+    testHost?: string
+    testPort?: number
+  }): Promise<{
+    success: boolean
+    error?: string
+    diagnose?: {
+      upstreamReachable: boolean
+      upstreamError?: string
+      upstreamRtMs?: number
+      targetReachable: boolean
+      targetError?: string
+      targetRtMs?: number
+      targetStatus?: number
+      targetStatusText?: string
+      targetBodySnippet?: string
+      endToEndOk?: boolean
+      endToEndError?: string
+      endToEndRtMs?: number
+    }
+  }> => {
+    return ipcRenderer.invoke('proxy-pool:diagnose-chain', params)
+  },
+
+  // ============ 诊断 API ============
+  /** 测试一个 URL 的连通性（GET，5 秒超时，不带代理特殊处理由主进程默认逻辑） */
+  diagnoseHttpProbe: (params: { url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }): Promise<{
+    success: boolean
+    latencyMs?: number
+    status?: number
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('diagnose:http-probe', params)
+  },
+
+  /**
+   * 设置账号 → 代理 URL 绑定（用于反代时"N 个账号一个 IP"分桶）
+   * @param accountId 账号 ID
+   * @param proxyUrl 代理 URL；undefined 表示解绑
+   */
+  accountSetProxyBinding: (accountId: string, proxyUrl: string | undefined): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('account-set-proxy-binding', accountId, proxyUrl)
+  },
+
+  // ============ 一键诊断 ============
+  diagnoseRun: (params: {
+    proxyUrl?: string
+    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
+  }): Promise<{ results: Array<{ id: string; label: string; url: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }> }> => {
+    return ipcRenderer.invoke('diagnose:run', params)
+  },
+
+  /**
+   * 账号测活：指定账号走反代逻辑给指定模型发一条测试消息，验证是否正常返回
+   */
+  diagnoseAccountLiveness: (params: {
+    account: {
+      id?: string; email?: string; accessToken?: string; refreshToken?: string
+      clientId?: string; clientSecret?: string; region?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
+    }
+    model?: string
+    message?: string
+    timeoutMs?: number
+  }): Promise<{
+    success: boolean
+    latencyMs: number
+    model?: string
+    content?: string
+    usage?: { inputTokens: number; outputTokens: number; credits: number }
+    error?: string
+  }> => {
+    return ipcRenderer.invoke('diagnose:account-liveness', params)
+  },
+
   // 获取注册状态
   registrationStatus: (): Promise<{ inProgress: boolean }> => {
     return ipcRenderer.invoke('registration-status')
+  },
+
+  // Proton 邮箱：打开登录窗口（首次需手动登录，之后 session 持久化复用）
+  protonOpenLogin: (proxy?: string): Promise<{ success: boolean; loggedIn: boolean; error?: string }> => {
+    return ipcRenderer.invoke('proton-open-login', proxy)
+  },
+
+  // Proton 邮箱：查询登录态（不弹窗）
+  protonLoginStatus: (proxy?: string): Promise<{ loggedIn: boolean }> => {
+    return ipcRenderer.invoke('proton-login-status', proxy)
+  },
+
+  // Proton 邮箱：关闭窗口（保留登录态）
+  protonClose: (): Promise<{ success: boolean }> => {
+    return ipcRenderer.invoke('proton-close')
   },
 
   // 监听注册日志
@@ -1105,6 +1307,32 @@ const api = {
     ipcRenderer.on('registration-log', handler)
     return () => {
       ipcRenderer.removeListener('registration-log', handler)
+    }
+  },
+
+  /** 监听注册流程的实时 step 事件（用于批量任务的"当前步骤"可视化） */
+  onRegistrationStep: (callback: (data: {
+    taskId?: string
+    event: {
+      name:
+        | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
+        | 'oidc' | 'device' | 'email-created'
+        | 'portal' | 'workflow-init' | 'submit-email'
+        | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
+        | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
+        | 'verify-alive' | 'done'
+      ts: number
+      email?: string
+      exitIp?: string
+      extra?: Record<string, unknown>
+    }
+  }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: Parameters<typeof callback>[0]): void => {
+      callback(data)
+    }
+    ipcRenderer.on('registration-step', handler)
+    return () => {
+      ipcRenderer.removeListener('registration-step', handler)
     }
   },
 

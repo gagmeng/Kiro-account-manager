@@ -1,6 +1,7 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { Play, Square, RefreshCw, Copy, Check, Server, Activity, AlertCircle, Globe, Zap, Loader2, FileText, Eye, EyeOff, Dices, Cpu, UserCheck, RotateCcw, Users, Clock, Settings2 } from 'lucide-react'
 import { Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Input, Label, Switch, Badge, Select } from '../ui'
+import { ProxySecurityPanel } from './ProxySecurityPanel'
 import { useAccountsStore } from '../../store/accounts'
 import { useTranslation } from '../../hooks/useTranslation'
 import { ProxyLogsDialog } from './ProxyLogsDialog'
@@ -72,14 +73,66 @@ interface ProxyConfig {
   maxRetries?: number
   preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   autoStart?: boolean
-  autoContinueRounds?: number
-  enableServerSideToolAutoContinue?: boolean
   clientDrivenToolExecution?: boolean
   disableTools?: boolean
   payloadSizeLimitKB?: number
+  enableTokenBufferReserve?: boolean
+  tokenBufferReserve?: number
   autoSwitchOnQuotaExhausted?: boolean
   accountSelectionStrategy?: 'round-robin' | 'sticky'
+  // 多账号轮询范围（与 main/proxy/types.ts 保持一致）
+  multiAccountSelectionMode?: 'all' | 'groups'
+  multiAccountGroupIds?: string[]
   modelMappings?: ModelMappingRule[]
+  // v1.8 安全 / 限流 / 可观测
+  maxRequestBodyBytes?: number
+  allowedIPs?: string[]
+  deniedIPs?: string[]
+  allowExternalWithoutApiKey?: boolean
+  rateLimitPerKeyPerMinute?: number
+  sessionAffinityEnabled?: boolean
+  keepAliveTimeoutMs?: number
+  headersTimeoutMs?: number
+  recentRequestsLimit?: number
+  enableMetrics?: boolean
+  fallbackPort?: number
+  enableAuditLog?: boolean
+}
+
+// 反代请求日志：模块级持久化 + 单次订阅，避免切到其它页面 unmount 后日志清空、中间请求事件丢失
+type RecentLogEntry = { time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }
+let _proxyRecentLogs: RecentLogEntry[] = []
+let _refSetProxyRecentLogs: ((v: RecentLogEntry[]) => void) | null = null
+let _proxyResponseListenerRegistered = false
+function ensureProxyResponseListenerRegistered(): void {
+  if (_proxyResponseListenerRegistered) return
+  _proxyResponseListenerRegistered = true
+  window.api.onProxyResponse((info) => {
+    const now = new Date()
+    const year = now.getFullYear()
+    const month = (now.getMonth() + 1).toString().padStart(2, '0')
+    const day = now.getDate().toString().padStart(2, '0')
+    const hours = now.getHours().toString().padStart(2, '0')
+    const minutes = now.getMinutes().toString().padStart(2, '0')
+    const seconds = now.getSeconds().toString().padStart(2, '0')
+    const ms = now.getMilliseconds().toString().padStart(3, '0')
+    const fullTime = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${ms}`
+    _proxyRecentLogs = [{
+      time: fullTime,
+      path: info.path,
+      model: info.model,
+      status: info.status,
+      tokens: info.tokens,
+      inputTokens: info.inputTokens,
+      outputTokens: info.outputTokens,
+      cacheReadTokens: info.cacheReadTokens,
+      reasoningTokens: info.reasoningTokens,
+      credits: info.credits,
+      responseTime: info.responseTime,
+      error: info.error
+    }, ..._proxyRecentLogs.slice(0, 99)]
+    _refSetProxyRecentLogs?.(_proxyRecentLogs)
+  })
 }
 
 export function ProxyPanel() {
@@ -100,7 +153,7 @@ export function ProxyPanel() {
   const [availableCount, setAvailableCount] = useState(0)
   const [copied, setCopied] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [recentLogs, setRecentLogs] = useState<Array<{ time: string; path: string; model?: string; status: number; tokens?: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; reasoningTokens?: number; credits?: number; responseTime?: number; error?: string }>>([])
+  const [recentLogs, setRecentLogs] = useState<RecentLogEntry[]>(_proxyRecentLogs)
   const [isSyncing, setIsSyncing] = useState(false)
   const [isRefreshingModels, setIsRefreshingModels] = useState(false)
   const [syncSuccess, setSyncSuccess] = useState(false)
@@ -119,6 +172,7 @@ export function ProxyPanel() {
   const [apiKeyGenerated, setApiKeyGenerated] = useState(false)
 
   const accounts = useAccountsStore(state => state.accounts)
+  const groups = useAccountsStore(state => state.groups)
 
   // 生成随机 API Key
   const generateApiKey = useCallback(() => {
@@ -172,8 +226,7 @@ export function ProxyPanel() {
         const clientDrivenToolExecution = cfg.clientDrivenToolExecution !== false
         setConfig({
           ...cfg,
-          clientDrivenToolExecution,
-          enableServerSideToolAutoContinue: clientDrivenToolExecution ? false : cfg.enableServerSideToolAutoContinue
+          clientDrivenToolExecution
         })
       }
       if (result.stats) {
@@ -202,13 +255,30 @@ export function ProxyPanel() {
   }, [])
 
   // 同步账号到反代池
-  const syncAccounts = useCallback(async () => {
+  // override 用于「改了分组配置立即重同步」场景：setConfig 后闭包里的 config 可能是旧值，
+  // 调用方传入新模式 / 新分组 ids，强制覆盖。
+  const syncAccounts = useCallback(async (override?: {
+    mode?: 'all' | 'groups'
+    groupIds?: string[]
+  }) => {
     setIsSyncing(true)
     setSyncSuccess(false)
     try {
-      const proxyAccounts = Array.from(accounts.values())
+      const selMode = override?.mode ?? config.multiAccountSelectionMode ?? 'all'
+      const selGroupIds = override?.groupIds ?? config.multiAccountGroupIds ?? []
+      let candidates = Array.from(accounts.values())
         .filter(acc => acc.status === 'active' && acc.credentials?.accessToken)
-        .map(acc => ({
+
+      // 多账号轮询 + 'groups' 范围：按选中分组过滤（'__ungrouped__' 表示未分组账号）
+      if (config.enableMultiAccount && selMode === 'groups') {
+        const gids = new Set(selGroupIds)
+        candidates = candidates.filter(acc => {
+          if (!acc.groupId) return gids.has('__ungrouped__')
+          return gids.has(acc.groupId)
+        })
+      }
+
+      const proxyAccounts = candidates.map(acc => ({
           id: acc.id,
           email: acc.email,
           accessToken: acc.credentials.accessToken,
@@ -221,7 +291,9 @@ export function ProxyPanel() {
           clientSecret: acc.credentials?.clientSecret,
           region: acc.credentials?.region || 'us-east-1',
           authMethod: acc.credentials?.authMethod,
-          provider: acc.credentials?.provider || acc.idp
+          provider: acc.credentials?.provider || acc.idp,
+          // 透传分组 ID：后端 getAvailableAccount 可据此做二次过滤（双保险），即便前端忘了重同步也安全
+          groupId: acc.groupId
         }))
 
       const result = await window.api.proxySyncAccounts(proxyAccounts)
@@ -236,7 +308,7 @@ export function ProxyPanel() {
     } finally {
       setIsSyncing(false)
     }
-  }, [accounts, fetchStatus])
+  }, [accounts, fetchStatus, config.enableMultiAccount, config.multiAccountSelectionMode, config.multiAccountGroupIds])
 
   // 启动服务器
   const handleStart = async () => {
@@ -251,8 +323,6 @@ export function ProxyPanel() {
         apiKey: config.apiKey,
         enableMultiAccount: config.enableMultiAccount,
         logRequests: config.logRequests,
-        autoContinueRounds: config.autoContinueRounds,
-        enableServerSideToolAutoContinue: config.clientDrivenToolExecution === false ? config.enableServerSideToolAutoContinue : false,
         clientDrivenToolExecution: config.clientDrivenToolExecution !== false,
         disableTools: config.disableTools
       })
@@ -284,9 +354,10 @@ export function ProxyPanel() {
     }
   }
 
-  // 复制地址
+  // 复制地址（0.0.0.0 对人不可读，复制为 localhost）
   const copyAddress = () => {
-    const address = `http://${config.host}:${config.port}`
+    const displayHost = config.host === '0.0.0.0' ? 'localhost' : config.host
+    const address = `http://${displayHost}:${config.port}`
     navigator.clipboard.writeText(address)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
@@ -340,34 +411,11 @@ export function ProxyPanel() {
       console.log('[Proxy] Request:', info)
     })
 
-    const unsubResponse = window.api.onProxyResponse((info) => {
-      const now = new Date()
-      const year = now.getFullYear()
-      const month = (now.getMonth() + 1).toString().padStart(2, '0')
-      const day = now.getDate().toString().padStart(2, '0')
-      const hours = now.getHours().toString().padStart(2, '0')
-      const minutes = now.getMinutes().toString().padStart(2, '0')
-      const seconds = now.getSeconds().toString().padStart(2, '0')
-      const ms = now.getMilliseconds().toString().padStart(3, '0')
-      const fullTime = `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${ms}`
-      setRecentLogs(prev => [{
-        time: fullTime,
-        path: info.path,
-        model: info.model,
-        status: info.status,
-        tokens: info.tokens,
-        inputTokens: info.inputTokens,
-        outputTokens: info.outputTokens,
-        cacheReadTokens: info.cacheReadTokens,
-        reasoningTokens: info.reasoningTokens,
-        credits: info.credits,
-        responseTime: info.responseTime,
-        error: info.error
-      }, ...prev.slice(0, 99)]) // 保留最多 100 条
-
-      // 更新统计
-      fetchStatus()
-    })
+    // onProxyResponse：模块级单次订阅；这里只注册 setter 通道 + 拉取请求触发统计刷新
+    ensureProxyResponseListenerRegistered()
+    _refSetProxyRecentLogs = setRecentLogs
+    // 触发一次统计刷新即可（统计有独立的 fetchStatus，不依赖订阅）
+    const unsubStatsHook = window.api.onProxyResponse(() => { fetchStatus() })
 
     const unsubError = window.api.onProxyError((err) => {
       console.error('[Proxy] Error:', err)
@@ -383,18 +431,41 @@ export function ProxyPanel() {
 
     return () => {
       unsubRequest()
-      unsubResponse()
+      unsubStatsHook()
       unsubError()
       unsubStatus()
+      _refSetProxyRecentLogs = null
     }
   }, [fetchStatus, loadAvailableModels])
 
-  // 账号变化时同步
+  // 用 ref 持有最新的 syncAccounts，避免把它放进下方 effect 依赖导致循环重触发
+  const syncAccountsRef = useRef(syncAccounts)
+  useEffect(() => { syncAccountsRef.current = syncAccounts }, [syncAccounts])
+
+  /**
+   * 账号集合签名：只反映"参与同步的账号 id + 分组"，**不含** token / 用量 / 状态时间戳。
+   * 这样后台 token 刷新、用量更新等高频变动不会触发重新同步（避免按钮疯狂闪烁），
+   * 仅在真正增删账号 / 改分组时才同步。token 更新由主进程账号池自身刷新逻辑处理。
+   */
+  const accountsSyncSignature = useMemo(() => {
+    return Array.from(accounts.values())
+      .filter(a => a.status === 'active' && a.credentials?.accessToken)
+      .map(a => `${a.id}:${a.groupId || ''}`)
+      .sort()
+      .join('|')
+  }, [accounts])
+
+  // 账号集合变化时同步（防抖 600ms + 仅签名变化才触发；跳过首次 mount 避免每次进页面都同步）
+  const syncMountedRef = useRef(false)
   useEffect(() => {
-    if (isRunning) {
-      syncAccounts()
+    if (!isRunning) return
+    if (!syncMountedRef.current) {
+      syncMountedRef.current = true
+      return
     }
-  }, [accounts, isRunning, syncAccounts])
+    const timer = setTimeout(() => { void syncAccountsRef.current() }, 600)
+    return () => clearTimeout(timer)
+  }, [accountsSyncSignature, isRunning])
 
   // 实时更新运行时间
   const [uptime, setUptime] = useState(0)
@@ -424,7 +495,7 @@ export function ProxyPanel() {
   return (
     <div className="space-y-4">
       {/* 状态卡片 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift relative z-10">
         <CardHeader className="pb-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
@@ -441,7 +512,7 @@ export function ProxyPanel() {
             <Badge 
               variant={isRunning ? 'default' : 'secondary'} 
               className={isRunning 
-                ? 'bg-green-500 text-white flex items-center gap-1.5 pr-2.5' 
+                ? 'bg-success text-white flex items-center gap-1.5 pr-2.5' 
                 : 'bg-muted text-muted-foreground flex items-center gap-1.5 pr-2.5'}
             >
               <span className={isRunning 
@@ -472,12 +543,12 @@ export function ProxyPanel() {
                 {isEn ? 'Stop Service' : '停止服务'}
               </Button>
             )}
-            <Button onClick={syncAccounts} variant="outline" className="gap-2" disabled={!isRunning || isSyncing}>
-              {isSyncing ? <Loader2 className="h-4 w-4 animate-spin" /> : syncSuccess ? <Check className="h-4 w-4 text-green-500" /> : <RefreshCw className="h-4 w-4" />}
+            <Button onClick={() => void syncAccounts()} variant="outline" className="gap-2" disabled={!isRunning || isSyncing}>
+              {isSyncing ? <Loader2 className="h-4 w-4 animate-spin" /> : syncSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
               {isSyncing ? (isEn ? 'Syncing...' : '同步中...') : syncSuccess ? (isEn ? 'Synced!' : '已同步') : (isEn ? 'Sync Accounts' : '同步账号')}
             </Button>
             <Button onClick={handleRefreshModels} variant="outline" className="gap-2" disabled={!isRunning || isRefreshingModels}>
-              {isRefreshingModels ? <Loader2 className="h-4 w-4 animate-spin" /> : refreshSuccess ? <Check className="h-4 w-4 text-green-500" /> : <RefreshCw className="h-4 w-4" />}
+              {isRefreshingModels ? <Loader2 className="h-4 w-4 animate-spin" /> : refreshSuccess ? <Check className="h-4 w-4 text-success" /> : <RefreshCw className="h-4 w-4" />}
               {isRefreshingModels ? (isEn ? 'Refreshing...' : '刷新中...') : refreshSuccess ? (isEn ? 'Refreshed!' : '已刷新') : (isEn ? 'Refresh Models' : '刷新模型')}
             </Button>
             <Button onClick={() => setShowModelsDialog(true)} variant="outline" className="gap-2" disabled={!isRunning}>
@@ -500,21 +571,30 @@ export function ProxyPanel() {
 
           {/* 服务地址 */}
           {isRunning && (
-            <div className="flex items-center gap-2">
-              <Label className="min-w-[80px]">{isEn ? 'Address:' : '服务地址:'}</Label>
-              <code className="flex-1 px-3 py-2 bg-muted rounded text-sm">
-                http://{config.host}:{config.port}
-              </code>
-              <Button variant="outline" size="icon" onClick={copyAddress}>
-                {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-              </Button>
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Label className="min-w-[80px]">{isEn ? 'Address:' : '服务地址:'}</Label>
+                <code className="flex-1 px-3 py-2 bg-muted rounded text-sm">
+                  http://{config.host === '0.0.0.0' ? 'localhost' : config.host}:{config.port}
+                </code>
+                <Button variant="outline" size="icon" onClick={copyAddress}>
+                  {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                </Button>
+              </div>
+              {config.host === '0.0.0.0' && (
+                <p className="text-xs text-muted-foreground pl-[88px]">
+                  {isEn
+                    ? `LAN devices use http://<this-machine-IP>:${config.port}`
+                    : `局域网设备请使用 http://<本机IP>:${config.port}`}
+                </p>
+              )}
             </div>
           )}
 
-          {/* 配置 */}
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="port">{isEn ? 'Port' : '端口'}</Label>
+          {/* 基础配置 — 4 列紧凑布局：端口 + 监听 + API Key + 格式选择 */}
+          <div className="grid grid-cols-12 gap-3">
+            <div className="col-span-2 space-y-1.5">
+              <Label htmlFor="port" className="text-xs">{isEn ? 'Port' : '端口'}</Label>
               <Input
                 id="port"
                 type="number"
@@ -525,24 +605,34 @@ export function ProxyPanel() {
                   window.api.proxyUpdateConfig({ port: newPort })
                 }}
                 disabled={isRunning}
+                className="h-9"
               />
             </div>
-            <div className="space-y-2">
+            <div className="col-span-3 space-y-1.5">
               <div className="flex items-center justify-between">
-                <Label htmlFor="host">{isEn ? 'Host' : '监听地址'}</Label>
-                <div className="flex items-center gap-1.5">
+                <Label htmlFor="host" className="text-xs" title={config.host === '0.0.0.0' ? (isEn ? 'LAN access enabled. Set an API Key and allow port through firewall.' : '已开启外网访问，建议设置 API Key + 防火墙放行端口') : (isEn ? 'Loopback only. Toggle Public for LAN access.' : '仅本机访问，开启「外网」可让局域网设备访问')}>{isEn ? 'Host' : '监听地址'}</Label>
+                <div className="flex items-center gap-1">
                   <Switch
                     id="publicAccess"
                     checked={config.host === '0.0.0.0'}
-                    onCheckedChange={(checked) => {
+                    onCheckedChange={async (checked) => {
                       const newHost = checked ? '0.0.0.0' : '127.0.0.1'
                       setConfig(prev => ({ ...prev, host: newHost }))
-                      window.api.proxyUpdateConfig({ host: newHost })
+                      await window.api.proxyUpdateConfig({ host: newHost })
+                      if (isRunning) {
+                        try {
+                          await window.api.proxyStop()
+                          await new Promise(r => setTimeout(r, 200))
+                          await window.api.proxyStart()
+                        } catch (err) {
+                          console.error('[Proxy] Failed to restart after host change:', err)
+                          setError(err instanceof Error ? err.message : String(err))
+                        }
+                      }
                     }}
-                    disabled={isRunning}
                     className="scale-75"
                   />
-                  <Label htmlFor="publicAccess" className="text-xs cursor-pointer">{isEn ? 'Public' : '外网'}</Label>
+                  <Label htmlFor="publicAccess" className="text-[10px] cursor-pointer">{isEn ? 'Public' : '外网'}</Label>
                 </div>
               </div>
               <Input
@@ -554,15 +644,38 @@ export function ProxyPanel() {
                   window.api.proxyUpdateConfig({ host: newHost })
                 }}
                 disabled={isRunning}
+                className={`h-9 ${config.host === '0.0.0.0' ? 'border-warning/50' : ''}`}
               />
             </div>
-          </div>
-
-          {/* API Key 配置 */}
-          <div className="space-y-2">
-            <Label htmlFor="apiKey">{isEn ? 'API Key (Optional)' : 'API Key (可选)'}</Label>
-            <div className="flex gap-2">
-              <div className="relative flex-1">
+            {/* API Key 区：占 7 列 */}
+            <div className="col-span-7 space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label htmlFor="apiKey" className="text-xs" title={isEn ? 'When set, requests must provide this key in Authorization or X-Api-Key header' : '设置后，请求需在 Authorization 或 X-Api-Key 头中提供此密钥'}>{isEn ? 'API Key (Optional)' : 'API Key (可选)'}</Label>
+                <div className="flex items-center gap-1">
+                  <Select
+                    value={apiKeyFormat}
+                    options={[
+                      { value: 'sk', label: 'sk-xxx' },
+                      { value: 'simple', label: 'PROXY_KEY' },
+                      { value: 'token', label: 'KEY:TOKEN' }
+                    ]}
+                    onChange={(v) => setApiKeyFormat(v as 'sk' | 'simple' | 'token')}
+                    className="w-[120px] h-7 text-xs [&>button]:h-7 [&>button]:py-0 [&>button]:px-2.5"
+                  />
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={generateApiKey} disabled={isRunning} title={isEn ? 'Generate' : '随机生成'}>
+                    {apiKeyGenerated ? <Check className="h-3.5 w-3.5 text-success" /> : <Dices className="h-3.5 w-3.5" />}
+                  </Button>
+                  {config.apiKey && (
+                    <Button variant="ghost" size="icon" className="h-7 w-7" onClick={copyApiKey} title={isEn ? 'Copy' : '复制'}>
+                      {apiKeyCopied ? <Check className="h-3.5 w-3.5 text-success" /> : <Copy className="h-3.5 w-3.5" />}
+                    </Button>
+                  )}
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => setShowApiKeyManager(true)} title={isEn ? 'Manage Multiple API Keys' : '管理多个 API Key'}>
+                    <Settings2 className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+              <div className="relative">
                 <Input
                   id="apiKey"
                   type={showApiKey ? 'text' : 'password'}
@@ -574,64 +687,25 @@ export function ProxyPanel() {
                     window.api.proxyUpdateConfig({ apiKey: newApiKey })
                   }}
                   disabled={isRunning}
-                  className="pr-10"
+                  className="pr-9 h-9"
                 />
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon"
-                  className="absolute right-0 top-0 h-full px-3 hover:bg-transparent"
+                  className="absolute right-0 top-0 h-full px-2.5 hover:bg-transparent"
                   onClick={() => setShowApiKey(!showApiKey)}
                   title={showApiKey ? (isEn ? 'Hide' : '隐藏') : (isEn ? 'Show' : '显示')}
                 >
-                  {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  {showApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                 </Button>
               </div>
-              <Select
-                value={apiKeyFormat}
-                options={[
-                  { value: 'sk', label: 'sk-xxx' },
-                  { value: 'simple', label: 'PROXY_KEY' },
-                  { value: 'token', label: 'KEY:TOKEN' }
-                ]}
-                onChange={(v) => setApiKeyFormat(v as 'sk' | 'simple' | 'token')}
-                className="w-[130px]"
-              />
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={generateApiKey}
-                disabled={isRunning}
-                title={isEn ? 'Generate Random Key' : '随机生成'}
-                className={apiKeyGenerated ? 'border-green-500 text-green-500' : ''}
-              >
-                {apiKeyGenerated ? <Check className="h-4 w-4" /> : <Dices className="h-4 w-4" />}
-              </Button>
-              {config.apiKey && (
-                <Button
-                  variant="outline"
-                  size="icon"
-                  onClick={copyApiKey}
-                  title={isEn ? 'Copy API Key' : '复制 API Key'}
-                  className={apiKeyCopied ? 'border-green-500 text-green-500' : ''}
-                >
-                  {apiKeyCopied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                </Button>
-              )}
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => setShowApiKeyManager(true)}
-                title={isEn ? 'Manage Multiple API Keys' : '管理多个 API Key'}
-                className="text-xs w-auto px-2"
-              >
-                {isEn ? 'Manage' : '管理'}
-              </Button>
             </div>
-            <p className="text-xs text-muted-foreground">{isEn ? 'When set, requests must provide this key in Authorization or X-Api-Key header' : '设置后，请求需要在 Authorization 或 X-Api-Key 头中提供此密钥'}</p>
           </div>
 
-          <div className="flex items-center justify-between flex-wrap gap-2">
+
+          {/* 运行模式开关区 — 网格化对齐，避免 flex-wrap 造成的凌乱布局 */}
+          <div className="grid grid-cols-3 gap-x-4 gap-y-3 items-center">
             <div className="flex items-center gap-2">
               <Switch
                 id="autoStart"
@@ -641,7 +715,7 @@ export function ProxyPanel() {
                   window.api.proxyUpdateConfig({ autoStart: checked })
                 }}
               />
-              <Label htmlFor="autoStart">{isEn ? 'Auto Start' : '随软件启动'}</Label>
+              <Label htmlFor="autoStart" className="text-sm cursor-pointer">{isEn ? 'Auto Start' : '随软件启动'}</Label>
             </div>
             <div className="flex items-center gap-2">
               <Switch
@@ -653,7 +727,7 @@ export function ProxyPanel() {
                 }}
                 disabled={isRunning}
               />
-              <Label htmlFor="multiAccount">{isEn ? 'Multi-Account' : '多账号轮询'}</Label>
+              <Label htmlFor="multiAccount" className="text-sm cursor-pointer">{isEn ? 'Multi-Account' : '多账号轮询'}</Label>
             </div>
             {/* 开启多账号轮询时显示策略选择 */}
             {config.enableMultiAccount && (
@@ -693,6 +767,117 @@ export function ProxyPanel() {
                 </span>
               </div>
             )}
+            {/* 多账号轮询范围：全部账号 / 指定分组 */}
+            {config.enableMultiAccount && (() => {
+              const selMode = config.multiAccountSelectionMode || 'all'
+              const selectedGids = new Set(config.multiAccountGroupIds || [])
+              const sortedGroups = Array.from(groups.values()).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+              const accountList = Array.from(accounts.values()).filter(a => a.status === 'active' && a.credentials?.accessToken)
+              const ungroupedCount = accountList.filter(a => !a.groupId).length
+              const countByGroup = new Map<string, number>()
+              for (const a of accountList) if (a.groupId) countByGroup.set(a.groupId, (countByGroup.get(a.groupId) || 0) + 1)
+              const selectedAccountTotal = selMode === 'all'
+                ? accountList.length
+                : accountList.filter(a => !a.groupId ? selectedGids.has('__ungrouped__') : selectedGids.has(a.groupId)).length
+              const toggleGid = (gid: string) => {
+                const next = new Set(selectedGids)
+                if (next.has(gid)) next.delete(gid); else next.add(gid)
+                const ids = Array.from(next)
+                setConfig(prev => ({ ...prev, multiAccountGroupIds: ids }))
+                window.api.proxyUpdateConfig({ multiAccountGroupIds: ids })
+                // 关键：立即用新分组 ids 重新同步账号池，避免「改了分组但反代仍用旧账号」的体感 bug
+                void syncAccounts({ mode: 'groups', groupIds: ids })
+              }
+              return (
+                <div className="col-span-2 flex flex-col gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <Label className="text-sm shrink-0">{isEn ? 'Scope' : '轮询范围'}:</Label>
+                    <div className="flex gap-1 bg-muted/30 rounded-lg p-0.5">
+                      {(['all', 'groups'] as const).map(mode => {
+                        const active = selMode === mode
+                        const label = mode === 'all'
+                          ? (isEn ? 'All Accounts' : '全部账号')
+                          : (isEn ? 'Specific Groups' : '指定分组')
+                        return (
+                          <button
+                            key={mode}
+                            type="button"
+                            disabled={isRunning}
+                            className={`px-3 py-1 rounded-md text-xs font-medium transition-all ${
+                              active ? 'bg-primary text-primary-foreground shadow-sm' : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                            } disabled:opacity-50 disabled:cursor-not-allowed`}
+                            onClick={() => {
+                              setConfig(prev => ({ ...prev, multiAccountSelectionMode: mode }))
+                              window.api.proxyUpdateConfig({ multiAccountSelectionMode: mode })
+                              // 关键：切换 all/groups 立即重新同步账号池
+                              void syncAccounts({ mode, groupIds: Array.from(selectedGids) })
+                            }}
+                          >
+                            {label}
+                          </button>
+                        )
+                      })}
+                    </div>
+                    <span className="text-xs text-muted-foreground">
+                      {selMode === 'all'
+                        ? (isEn ? `${selectedAccountTotal} active accounts` : `${selectedAccountTotal} 个活跃账号`)
+                        : (isEn ? `${selectedAccountTotal} accounts in selected groups` : `已选分组共 ${selectedAccountTotal} 个账号`)}
+                    </span>
+                  </div>
+
+                  {/* 分组多选 chip：仅 groups 模式 */}
+                  {selMode === 'groups' && (
+                    <div className="flex flex-wrap items-center gap-1.5 pl-[60px]">
+                      {/* 未分组特殊 chip */}
+                      <button
+                        type="button"
+                        disabled={isRunning}
+                        onClick={() => toggleGid('__ungrouped__')}
+                        className={`flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium border transition-all ${
+                          selectedGids.has('__ungrouped__')
+                            ? 'bg-muted text-foreground border-muted-foreground/30'
+                            : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/40'
+                        } disabled:opacity-50 disabled:cursor-not-allowed`}
+                      >
+                        {selectedGids.has('__ungrouped__') && <Check className="h-3 w-3" />}
+                        <span>{isEn ? 'Ungrouped' : '未分组'}</span>
+                        <span className="text-[10px] opacity-70">({ungroupedCount})</span>
+                      </button>
+                      {/* 用户分组 chips */}
+                      {sortedGroups.map(group => {
+                        const isSel = selectedGids.has(group.id)
+                        const count = countByGroup.get(group.id) || 0
+                        return (
+                          <button
+                            key={group.id}
+                            type="button"
+                            disabled={isRunning}
+                            onClick={() => toggleGid(group.id)}
+                            className={`flex items-center gap-1 px-2 h-7 rounded-md text-xs font-medium border transition-all ${
+                              isSel ? 'text-foreground' : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/40'
+                            } disabled:opacity-50 disabled:cursor-not-allowed`}
+                            style={isSel ? {
+                              backgroundColor: (group.color || '#888') + '22',
+                              borderColor: (group.color || '#888') + '66'
+                            } : undefined}
+                          >
+                            {isSel && <Check className="h-3 w-3" style={{ color: group.color || undefined }} />}
+                            <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: group.color || '#888' }} />
+                            <span>{group.name}</span>
+                            <span className="text-[10px] opacity-70">({count})</span>
+                          </button>
+                        )
+                      })}
+                      {sortedGroups.length === 0 && (
+                        <span className="text-xs text-muted-foreground italic">
+                          {isEn ? 'No groups defined yet. Create groups in Account Manager first.' : '尚未定义任何分组，请先在账户管理中创建分组'}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })()}
             {/* 关闭多账号轮询时显示账号选择按钮和自动切换开关 */}
             {!config.enableMultiAccount && (
               <>
@@ -714,7 +899,7 @@ export function ProxyPanel() {
                     )}
                   </Button>
                 </div>
-                <div className="col-span-2 flex items-center gap-2">
+                <div className="flex items-center gap-2">
                   <Switch
                     id="autoSwitchOnQuotaExhausted"
                     checked={config.autoSwitchOnQuotaExhausted || false}
@@ -724,8 +909,8 @@ export function ProxyPanel() {
                     }}
                     disabled={isRunning}
                   />
-                  <Label htmlFor="autoSwitchOnQuotaExhausted" className="text-sm">
-                    {isEn ? 'Auto-switch on quota exhausted' : '额度耗尽自动切换账号'}
+                  <Label htmlFor="autoSwitchOnQuotaExhausted" className="text-sm cursor-pointer truncate" title={isEn ? 'Auto-switch on quota exhausted' : '额度耗尽自动切换账号'}>
+                    {isEn ? 'Auto-switch' : '额度切换'}
                   </Label>
                 </div>
               </>
@@ -739,7 +924,7 @@ export function ProxyPanel() {
                   window.api.proxyUpdateConfig({ logRequests: checked })
                 }}
               />
-              <Label htmlFor="logRequests">{isEn ? 'Log Requests' : '记录日志'}</Label>
+              <Label htmlFor="logRequests" className="text-sm cursor-pointer">{isEn ? 'Log Requests' : '记录日志'}</Label>
             </div>
             <div className="flex items-center gap-2">
               <Switch
@@ -750,16 +935,19 @@ export function ProxyPanel() {
                   window.api.proxyUpdateConfig({ logStreamEvents: checked })
                 }}
               />
-              <Label htmlFor="logStreamEvents">{isEn ? 'Stream Events' : '流式日志'}</Label>
+              <Label htmlFor="logStreamEvents" className="text-sm cursor-pointer">{isEn ? 'Stream Events' : '流式日志'}</Label>
             </div>
           </div>
 
-          {/* 高级配置 */}
-          <div className="border-t border-border pt-4 mt-4">
-            <h4 className="text-sm font-medium mb-3 text-foreground">{isEn ? 'Advanced Settings' : '高级配置'}</h4>
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="preferredEndpoint">{isEn ? 'Preferred Endpoint' : '首选端点'}</Label>
+          {/* 高级配置 — 3 列紧凑布局，描述移到 Label 的 title tooltip */}
+          <div className="border-t border-border pt-3 overflow-visible">
+            <h4 className="text-xs font-medium mb-2 text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+              <Settings2 className="h-3.5 w-3.5" />
+              {isEn ? 'Advanced Settings' : '高级配置'}
+            </h4>
+            <div className="grid grid-cols-3 gap-x-3 gap-y-3 items-start overflow-visible">
+              <div className="space-y-1.5 relative z-20">
+                <Label htmlFor="preferredEndpoint" className="text-xs">{isEn ? 'Preferred Endpoint' : '首选端点'}</Label>
                 <Select
                   value={config.preferredEndpoint || ''}
                   options={[
@@ -776,8 +964,8 @@ export function ProxyPanel() {
                   placeholder={isEn ? 'Select endpoint' : '选择端点'}
                 />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="maxRetries">{isEn ? 'Max Retries' : '最大重试次数'}</Label>
+              <div className="space-y-1.5">
+                <Label htmlFor="maxRetries" className="text-xs">{isEn ? 'Max Retries' : '最大重试次数'}</Label>
                 <Input
                   id="maxRetries"
                   type="number"
@@ -790,77 +978,11 @@ export function ProxyPanel() {
                     window.api.proxyUpdateConfig({ maxRetries: retries })
                   }}
                   disabled={isRunning}
+                  className="h-9"
                 />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="clientDrivenToolExecution">{isEn ? 'Tool Execution Mode' : '工具执行模式'}</Label>
-                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
-                  <span className="text-sm text-muted-foreground">{isEn ? 'Client-driven tool execution' : '客户端驱动工具执行'}</span>
-                  <Switch
-                    id="clientDrivenToolExecution"
-                    checked={config.clientDrivenToolExecution !== false}
-                    onCheckedChange={(checked) => {
-                      setConfig(prev => ({
-                        ...prev,
-                        clientDrivenToolExecution: checked,
-                        enableServerSideToolAutoContinue: checked ? false : prev.enableServerSideToolAutoContinue
-                      }))
-                      window.api.proxyUpdateConfig({
-                        clientDrivenToolExecution: checked,
-                        ...(checked ? { enableServerSideToolAutoContinue: false } : {})
-                      })
-                    }}
-                    disabled={isRunning}
-                  />
-                </div>
-                <p className="text-xs text-muted-foreground">{isEn ? 'Recommended for OpenCode and Claude Code. Disable only when the proxy should fabricate tool results and continue server-side.' : '推荐用于 OpenCode 和 Claude Code。仅在需要代理伪造工具结果并服务端继续时关闭。'}</p>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="autoContinueRounds">{isEn ? 'Auto Continue Rounds' : '自动继续轮数'}</Label>
-                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
-                  <span className="text-sm text-muted-foreground">{isEn ? 'Server-side tool auto continue' : '服务端工具自动继续'}</span>
-                  <Switch
-                    id="enableServerSideToolAutoContinue"
-                    checked={config.enableServerSideToolAutoContinue || false}
-                    onCheckedChange={(checked) => {
-                      setConfig(prev => ({ ...prev, enableServerSideToolAutoContinue: checked }))
-                      window.api.proxyUpdateConfig({ enableServerSideToolAutoContinue: checked })
-                    }}
-                    disabled={isRunning || config.clientDrivenToolExecution !== false}
-                  />
-                </div>
-                <Input
-                  id="autoContinueRounds"
-                  type="number"
-                  min={0}
-                  max={20}
-                  value={config.autoContinueRounds || 0}
-                  onChange={(e) => {
-                    const rounds = parseInt(e.target.value) || 0
-                    setConfig(prev => ({ ...prev, autoContinueRounds: rounds }))
-                    window.api.proxyUpdateConfig({ autoContinueRounds: rounds })
-                  }}
-                  disabled={isRunning || !config.enableServerSideToolAutoContinue || config.clientDrivenToolExecution !== false}
-                />
-                <p className="text-xs text-muted-foreground">{isEn ? 'Disabled by default for API compatibility. Enable only when you want the proxy to auto-send "Continue" after tool calls.' : '为保证 API 兼容性默认禁用。仅在需要代理自动发送“继续”时启用。'}</p>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="disableTools">{isEn ? 'Disable Tool Calls' : '禁用工具调用'}</Label>
-                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
-                  <span className="text-sm text-muted-foreground">{isEn ? 'AI will not call any tools' : 'AI 不会调用任何工具'}</span>
-                  <Switch
-                    id="disableTools"
-                    checked={config.disableTools || false}
-                    onCheckedChange={(checked) => {
-                      setConfig(prev => ({ ...prev, disableTools: checked }))
-                      window.api.proxyUpdateConfig({ disableTools: checked })
-                    }}
-                    disabled={isRunning}
-                  />
-                </div>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="payloadSizeLimit">{isEn ? 'Payload Size Limit (KB)' : 'Payload 大小限制 (KB)'}</Label>
+              <div className="space-y-1.5">
+                <Label htmlFor="payloadSizeLimit" className="text-xs" title={isEn ? 'When payload exceeds this limit, oldest tool results will be truncated. Default 1536KB (1.5MB).' : '超过此限制时，最旧工具结果将被截断。默认 1536KB (1.5MB)'}>{isEn ? 'Payload (KB)' : 'Payload (KB)'}</Label>
                 <Input
                   id="payloadSizeLimit"
                   type="number"
@@ -874,18 +996,93 @@ export function ProxyPanel() {
                     window.api.proxyUpdateConfig({ payloadSizeLimitKB: kb })
                   }}
                   disabled={isRunning}
+                  className="h-9"
                 />
-                <p className="text-xs text-muted-foreground">{isEn ? 'When payload exceeds this limit, oldest tool results will be truncated. Default 1536KB (1.5MB). Reduce if API rejects large payloads.' : '超过此限制时，最旧的工具结果将被截断。默认 1536KB (1.5MB)，如 API 拒绝大 payload 可调小。'}</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="clientDrivenToolExecution" className="text-xs" title={isEn ? 'Recommended for OpenCode and Claude Code. Disable only when the proxy should fabricate tool results.' : '推荐用于 OpenCode 和 Claude Code。仅在需要代理伪造工具结果时关闭。'}>{isEn ? 'Tool Execution' : '工具执行模式'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
+                  <span className="text-xs text-muted-foreground">{isEn ? 'Client-driven' : '客户端驱动'}</span>
+                  <Switch
+                    id="clientDrivenToolExecution"
+                    checked={config.clientDrivenToolExecution !== false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({ ...prev, clientDrivenToolExecution: checked }))
+                      window.api.proxyUpdateConfig({ clientDrivenToolExecution: checked })
+                    }}
+                    disabled={isRunning}
+                    className="scale-90"
+                  />
+                </div>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="disableTools" className="text-xs" title={isEn ? 'When enabled, the proxy strips all tool definitions from requests.' : '启用后代理会从请求中移除所有工具定义，适用于纯聊天。'}>{isEn ? 'Disable Tools' : '禁用工具调用'}</Label>
+                <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent">
+                  <span className="text-xs text-muted-foreground">{isEn ? 'No tool calls' : '不调用工具'}</span>
+                  <Switch
+                    id="disableTools"
+                    checked={config.disableTools || false}
+                    onCheckedChange={(checked) => {
+                      setConfig(prev => ({ ...prev, disableTools: checked }))
+                      window.api.proxyUpdateConfig({ disableTools: checked })
+                    }}
+                    disabled={isRunning}
+                    className="scale-90"
+                  />
+                </div>
+              </div>
+              {/* Token Buffer Reserve — 占 3 列合为一行：开关 + 输入 */}
+              <div className="col-span-3 space-y-1.5">
+                <Label htmlFor="tokenBufferReserve" className="text-xs" title={isEn ? 'When enabled, reserves N tokens below context window for trim (e.g. 200K → trim at 180K). When disabled, never trims.' : '启用后从模型 context window 预留 N 个 token 作为裁剪阈值（例：200K → 180K 裁剪）。关闭时不裁剪任何旧消息。'}>{isEn ? 'Token Buffer Reserve (auto-trim history)' : 'Token Buffer 预留 (自动裁旧 history)'}</Label>
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center justify-between h-9 px-3 rounded-md border border-input bg-transparent w-[160px] flex-shrink-0">
+                    <span className="text-xs text-muted-foreground">{isEn ? 'Auto-trim' : '启用裁剪'}</span>
+                    <Switch
+                      id="enableTokenBufferReserve"
+                      checked={config.enableTokenBufferReserve || false}
+                      onCheckedChange={(checked) => {
+                        setConfig(prev => ({ ...prev, enableTokenBufferReserve: checked }))
+                        window.api.proxyUpdateConfig({ enableTokenBufferReserve: checked })
+                      }}
+                      disabled={isRunning}
+                      className="scale-90"
+                    />
+                  </div>
+                  <Input
+                    id="tokenBufferReserve"
+                    type="number"
+                    min={5000}
+                    max={150000}
+                    step={1000}
+                    value={config.tokenBufferReserve || 20000}
+                    onChange={(e) => {
+                      const tokens = parseInt(e.target.value) || 20000
+                      setConfig(prev => ({ ...prev, tokenBufferReserve: tokens }))
+                      window.api.proxyUpdateConfig({ tokenBufferReserve: tokens })
+                    }}
+                    disabled={isRunning || !config.enableTokenBufferReserve}
+                    placeholder={isEn ? 'Reserve tokens (default 20000)' : '预留 token 数（默认 20000）'}
+                    className="h-9 flex-1"
+                  />
+                </div>
               </div>
             </div>
           </div>
         </CardContent>
       </Card>
 
+      {/* v1.8 反代安全 / 可观测设置（独立卡片，可折叠） */}
+      <ProxySecurityPanel
+        config={config as unknown as Parameters<typeof ProxySecurityPanel>[0]['config']}
+        setConfig={setConfig as unknown as Parameters<typeof ProxySecurityPanel>[0]['setConfig']}
+        isRunning={isRunning}
+        isEn={isEn}
+      />
+
       {/* 统计卡片 */}
       {isRunning && (
         <div className="grid grid-cols-6 gap-3">
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-blue-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-blue-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Users className="h-3 w-3" />
@@ -894,7 +1091,7 @@ export function ProxyPanel() {
               <div className="text-xl font-bold text-foreground">{availableCount}/{accountCount}</div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-purple-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-purple-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center justify-between mb-1">
                 <div className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -923,20 +1120,20 @@ export function ProxyPanel() {
               <div className="text-xl font-bold text-foreground">{stats?.totalRequests || 0}</div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-green-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-green-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Check className="h-3 w-3" />
                 <span>{isEn ? 'Total S/F' : '总计成功/失败'}</span>
               </div>
               <div className="text-xl font-bold">
-                <span className="text-green-500">{stats?.successRequests || 0}</span>
+                <span className="text-success">{stats?.successRequests || 0}</span>
                 <span className="text-muted-foreground mx-1">/</span>
-                <span className="text-red-500">{stats?.failedRequests || 0}</span>
+                <span className="text-destructive">{stats?.failedRequests || 0}</span>
               </div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-cyan-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-cyan-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Zap className="h-3 w-3" />
@@ -945,20 +1142,20 @@ export function ProxyPanel() {
               <div className="text-xl font-bold text-foreground">{sessionStats?.totalRequests || 0}</div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-orange-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-orange-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Activity className="h-3 w-3" />
                 <span>{isEn ? 'Session S/F' : '本次成功/失败'}</span>
               </div>
               <div className="text-xl font-bold">
-                <span className="text-green-500">{sessionStats?.successRequests || 0}</span>
+                <span className="text-success">{sessionStats?.successRequests || 0}</span>
                 <span className="text-muted-foreground mx-1">/</span>
-                <span className="text-red-500">{sessionStats?.failedRequests || 0}</span>
+                <span className="text-destructive">{sessionStats?.failedRequests || 0}</span>
               </div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-primary/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-primary/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Clock className="h-3 w-3" />
@@ -973,7 +1170,7 @@ export function ProxyPanel() {
       {/* 第二行统计卡片 - Token 分解和 Cache */}
       {isRunning && stats && (
         <div className="grid grid-cols-6 gap-3">
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-indigo-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-indigo-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Activity className="h-3 w-3" />
@@ -982,7 +1179,7 @@ export function ProxyPanel() {
               <div className="text-xl font-bold text-indigo-500" title={((stats.inputTokens || 0) + (stats.outputTokens || 0)).toLocaleString()}>{compactNumber((stats.inputTokens || 0) + (stats.outputTokens || 0))}</div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-blue-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-blue-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Activity className="h-3 w-3" />
@@ -995,7 +1192,7 @@ export function ProxyPanel() {
               </div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-emerald-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-emerald-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Cpu className="h-3 w-3" />
@@ -1016,7 +1213,7 @@ export function ProxyPanel() {
               </div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-violet-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-violet-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Zap className="h-3 w-3" />
@@ -1025,18 +1222,18 @@ export function ProxyPanel() {
               <div className="text-xl font-bold text-violet-500" title={(stats.reasoningTokens || 0).toLocaleString()}>{compactNumber(stats.reasoningTokens || 0)}</div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-green-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-green-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <UserCheck className="h-3 w-3" />
                 <span>{isEn ? 'Success Rate' : '成功率'}</span>
               </div>
-              <div className="text-xl font-bold text-green-500">
+              <div className="text-xl font-bold text-success">
                 {stats.totalRequests > 0 ? `${((stats.successRequests / stats.totalRequests) * 100).toFixed(1)}%` : '-'}
               </div>
             </CardContent>
           </Card>
-          <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200 bg-gradient-to-br from-amber-500/5 to-transparent">
+          <Card className="hover-lift bg-gradient-to-br from-amber-500/5 to-transparent">
             <CardContent className="pt-3 pb-3">
               <div className="flex items-center gap-1 text-xs text-muted-foreground mb-1">
                 <Server className="h-3 w-3" />
@@ -1049,7 +1246,7 @@ export function ProxyPanel() {
       )}
 
       {/* API 端点说明 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-2">
             <div className="p-1.5 rounded-lg bg-primary/10">
@@ -1127,7 +1324,7 @@ export function ProxyPanel() {
 
       {/* 最近请求日志 */}
       {recentLogs.length > 0 && (
-        <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+        <Card className="hover-lift">
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between">
               <CardTitle className="text-base flex items-center gap-2">
@@ -1156,10 +1353,10 @@ export function ProxyPanel() {
                   <span className="text-muted-foreground whitespace-nowrap text-left">{log.time}</span>
                   <span className="truncate text-left" title={log.path}>{log.path}</span>
                   <span className="truncate text-left text-muted-foreground" title={log.model}>{log.model ? log.model.replace('anthropic.', '').replace('-v1:0', '') : '-'}</span>
-                  <span className={`text-center ${log.status >= 400 ? 'text-red-500' : 'text-green-500'}`}>{log.status}</span>
+                  <span className={`text-center ${log.status >= 400 ? 'text-destructive' : 'text-success'}`}>{log.status}</span>
                   <span className="text-muted-foreground text-right">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</span>
-                  <span className="text-emerald-500 text-right">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</span>
+                  <span className="text-success text-right">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.credits ? log.credits.toFixed(4) : '-'}</span>
                   <span className="text-muted-foreground text-right">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</span>
                 </div>
@@ -1170,7 +1367,7 @@ export function ProxyPanel() {
       )}
 
       {/* 功能说明 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-2">
             <div className="p-1.5 rounded-lg bg-primary/10">
@@ -1302,7 +1499,7 @@ export function ProxyPanel() {
       {/* API Key 管理弹窗 */}
       {showApiKeyManager && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setShowApiKeyManager(false)} />
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowApiKeyManager(false)} />
           <div className="relative bg-background rounded-lg shadow-lg w-[800px] max-h-[80vh] overflow-y-auto p-4">
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-lg font-semibold">{isEn ? 'API Key Management' : 'API Key 管理'}</h2>
@@ -1316,3 +1513,5 @@ export function ProxyPanel() {
     </div>
   )
 }
+
+

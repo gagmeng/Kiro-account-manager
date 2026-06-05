@@ -71,10 +71,12 @@ export class AccountPool {
   }
 
   // 添加账号
+  // 如果传入的 account 已带 suspended 字段（启动复原场景），保留其 suspended 状态
   addAccount(account: ProxyAccount): void {
+    const suspended = this.isSuspended(account)
     this.accounts.set(account.id, {
       ...account,
-      isAvailable: true,
+      isAvailable: !suspended,
       requestCount: 0,
       errorCount: 0,
       lastUsed: 0
@@ -89,7 +91,11 @@ export class AccountPool {
       avgResponseTime: 0,
       totalResponseTime: 0
     })
-    console.log(`[AccountPool] Added account: ${account.email || account.id}`)
+    if (suspended) {
+      console.warn(`[AccountPool] Added SUSPENDED account: ${account.email || account.id} (${account.suspendReason})`)
+    } else {
+      console.log(`[AccountPool] Added account: ${account.email || account.id}`)
+    }
   }
 
   // 移除账号
@@ -158,24 +164,25 @@ export class AccountPool {
     return this.accounts.get(accountId) || null
   }
 
-  // 获取下一个可用账号（排除当前账号）
-  getNextAvailableAccount(excludeAccountId: string): ProxyAccount | null {
+  // 获取下一个可用账号（排除指定账号；支持单 ID 或 ID 集合）
+  // 集合形式用于「请求级累计已试账号」，避免重试时循环命中已经失败过的账号
+  getNextAvailableAccount(exclude: string | Set<string>): ProxyAccount | null {
+    const excludeSet = typeof exclude === 'string' ? new Set([exclude]) : exclude
     const accountList = Array.from(this.accounts.values())
-    if (accountList.length <= 1) {
-      return null
-    }
+    if (accountList.length === 0) return null
 
     const now = Date.now()
-    
-    // 尝试找到一个可用的账号（排除当前账号）
+
+    // 尝试找到一个可用的账号（排除指定账号）
     for (const account of accountList) {
-      if (account.id !== excludeAccountId && this.isAccountAvailable(account, now)) {
+      if (!excludeSet.has(account.id) && this.isAccountAvailable(account, now)) {
         return account
       }
     }
 
-    // 没有立即可用的账号，返回冷却时间最短的（排除当前账号）
-    const otherAccounts = accountList.filter(a => a.id !== excludeAccountId)
+    // 没有立即可用的账号，返回冷却时间最短的（排除指定账号）
+    const otherAccounts = accountList.filter(a => !excludeSet.has(a.id))
+    if (otherAccounts.length === 0) return null
     return this.getAccountWithShortestCooldown(otherAccounts, now)
   }
 
@@ -186,13 +193,22 @@ export class AccountPool {
 
   // 检查账号是否可用（断路器 + 指数退避 + 概率重试）
   private isAccountAvailable(account: ProxyAccount, now: number): boolean {
+    // 检查是否被 Kiro 后端封禁（需人工解封）
+    if (this.isSuspended(account)) {
+      return false
+    }
+
     // 检查配额是否耗尽
     if (this.isQuotaExhausted(account, now)) {
       return false
     }
 
     // 检查 token 是否过期
-    if (account.expiresAt && account.expiresAt < now) {
+    // - 无 refreshToken 时直接判为不可用（无法刷新）
+    // - 有 refreshToken 时让账号通过 —— proxyServer.getAvailableAccount 会检测
+    //   isTokenExpiringSoon 并主动调用 refreshToken；若刷新失败会通过 markNeedsRefresh
+    //   设置 isAvailable=false，下次循环再被本函数 line 210 跳过，形成闭环
+    if (account.expiresAt && account.expiresAt < now && !account.refreshToken) {
       return false
     }
 
@@ -219,6 +235,46 @@ export class AccountPool {
     }
 
     return true
+  }
+
+  // 检查账号是否被长期封禁（TEMPORARILY_SUSPENDED / AccountSuspendedException 等风控触发）
+  // 不同于临时 errorCount 冷却，需要人工解封或调用 clearSuspended
+  isSuspended(account: ProxyAccount): boolean {
+    return typeof account.suspendedAt === 'number' && account.suspendedAt > 0
+  }
+
+  // 标记账号为被封禁状态，账号池会持续跳过该账号直到 clearSuspended
+  markSuspended(accountId: string, reason: string, message?: string): boolean {
+    const account = this.accounts.get(accountId)
+    if (!account) return false
+    if (this.isSuspended(account) && account.suspendReason === reason) {
+      // 已标记过同样原因，不重复记录
+      return false
+    }
+    this.accounts.set(accountId, {
+      ...account,
+      suspendedAt: Date.now(),
+      suspendReason: reason,
+      suspendMessage: message,
+      isAvailable: false
+    })
+    console.warn(`[AccountPool] Account ${account.email || accountId} SUSPENDED (${reason})`)
+    return true
+  }
+
+  // 解除账号封禁标记（供手动重置或检测到被解封后调用）
+  clearSuspended(accountId: string): void {
+    const account = this.accounts.get(accountId)
+    if (!account || !this.isSuspended(account)) return
+    this.accounts.set(accountId, {
+      ...account,
+      suspendedAt: undefined,
+      suspendReason: undefined,
+      suspendMessage: undefined,
+      isAvailable: true,
+      errorCount: 0
+    })
+    console.log(`[AccountPool] Account ${account.email || accountId} unsuspended`)
   }
 
   // 检查账号配额是否耗尽
@@ -409,7 +465,7 @@ export class AccountPool {
     }
   }
 
-  // 重置所有账号状态
+  // 重置所有账号状态（含封禁标记 — 手动重置表示用户已确认可用）
   reset(): void {
     for (const [id, account] of this.accounts) {
       this.accounts.set(id, {
@@ -417,7 +473,10 @@ export class AccountPool {
         isAvailable: true,
         errorCount: 0,
         cooldownUntil: undefined,
-        quotaExhaustedAt: undefined
+        quotaExhaustedAt: undefined,
+        suspendedAt: undefined,
+        suspendReason: undefined,
+        suspendMessage: undefined
       })
     }
     this.currentIndex = 0

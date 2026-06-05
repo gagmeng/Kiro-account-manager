@@ -52,6 +52,32 @@ const themeGroupsZh = [
       { id: 'stone', name: '暖灰', color: '#78716c' },
       { id: 'neutral', name: '中性灰', color: '#737373' },
     ]
+  },
+  {
+    name: '奢华配色',
+    themes: [
+      { id: 'gold', name: '奢华金', color: '#C9A227' },
+      { id: 'navy', name: '海军蓝', color: '#1E40AF' },
+      { id: 'wine', name: '酒红', color: '#9F1239' },
+      { id: 'champagne', name: '香槟', color: '#B89968' },
+    ]
+  },
+  {
+    name: '莫兰迪',
+    themes: [
+      { id: 'dustyblue', name: '烟雾蓝', color: '#64748B' },
+      { id: 'terracotta', name: '陶土橙', color: '#B45434' },
+      { id: 'sage', name: '鼠尾草', color: '#6B8E5A' },
+      { id: 'mauve', name: '烟紫', color: '#8E7CC3' },
+    ]
+  },
+  {
+    name: '自然深色',
+    themes: [
+      { id: 'coral', name: '珊瑚粉', color: '#F87171' },
+      { id: 'forest', name: '森林绿', color: '#166534' },
+      { id: 'ocean', name: '深海青', color: '#155E75' },
+    ]
   }
 ]
 
@@ -101,6 +127,32 @@ const themeGroupsEn = [
       { id: 'stone', name: 'Stone', color: '#78716c' },
       { id: 'neutral', name: 'Neutral', color: '#737373' },
     ]
+  },
+  {
+    name: 'Luxury',
+    themes: [
+      { id: 'gold', name: 'Gold', color: '#C9A227' },
+      { id: 'navy', name: 'Navy', color: '#1E40AF' },
+      { id: 'wine', name: 'Wine', color: '#9F1239' },
+      { id: 'champagne', name: 'Champagne', color: '#B89968' },
+    ]
+  },
+  {
+    name: 'Morandi',
+    themes: [
+      { id: 'dustyblue', name: 'Dusty Blue', color: '#64748B' },
+      { id: 'terracotta', name: 'Terracotta', color: '#B45434' },
+      { id: 'sage', name: 'Sage', color: '#6B8E5A' },
+      { id: 'mauve', name: 'Mauve', color: '#8E7CC3' },
+    ]
+  },
+  {
+    name: 'Natural',
+    themes: [
+      { id: 'coral', name: 'Coral', color: '#F87171' },
+      { id: 'forest', name: 'Forest', color: '#166534' },
+      { id: 'ocean', name: 'Ocean', color: '#155E75' },
+    ]
   }
 ]
 
@@ -114,6 +166,9 @@ export function SettingsPage() {
     autoRefreshInterval,
     autoRefreshConcurrency,
     autoRefreshSyncInfo,
+    proactiveRenewalEnabled,
+    proactiveRenewalLeadMinutes,
+    setProactiveRenewalEnabled,
     setAutoRefresh,
     setAutoRefreshConcurrency,
     setAutoRefreshSyncInfo,
@@ -348,7 +403,7 @@ export function SettingsPage() {
   return (
     <div className="flex-1 p-6 space-y-6 overflow-auto">
       {/* 页面头部 */}
-      <div className="relative overflow-hidden rounded-xl bg-gradient-to-r from-primary/10 via-primary/5 to-primary/10 p-6 border border-primary/20">
+      <div className="page-hero p-6">
         <div className="absolute top-0 right-0 w-32 h-32 bg-gradient-to-br from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="absolute bottom-0 left-0 w-24 h-24 bg-gradient-to-tr from-primary/20 to-transparent rounded-full blur-2xl" />
         <div className="relative flex items-center gap-4">
@@ -363,7 +418,7 @@ export function SettingsPage() {
       </div>
 
       {/* 语言设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -397,7 +452,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 主题设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -477,7 +532,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 隐私设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -547,7 +602,7 @@ export function SettingsPage() {
       </Card>
 
       {/* Token 刷新设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -570,6 +625,78 @@ export function SettingsPage() {
               {autoRefreshEnabled ? (isEn ? 'On' : '已开启') : (isEn ? 'Off' : '已关闭')}
             </Button>
           </div>
+
+          <div className="text-xs text-muted-foreground bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 rounded-lg p-3 space-y-1">
+            <p className="font-medium text-amber-700 dark:text-amber-300">
+              {isEn ? 'About Kiro IDE auto refresh' : '关于 Kiro IDE 自动刷新'}
+            </p>
+            <p>
+              {isEn
+                ? '• Kiro IDE has its own internal refresh loop (independent of this app). Disabling Auto Refresh here only stops this app from refreshing — it does NOT stop Kiro IDE.'
+                : '• Kiro IDE 自带独立的刷新循环，关闭本工具的"自动刷新"不会停止 IDE 自己的刷新。'}
+            </p>
+            <p>
+              {isEn
+                ? '• When switching accounts or refreshing tokens here, the new token is synced to ~/.aws/sso/cache/kiro-auth-token.json only for the IDE current active account; other accounts only update the local store.'
+                : '• 切号 / 刷新 Token 时，仅当该账号是 Kiro IDE 当前激活账号才会同步到磁盘文件；非激活账号仅更新本工具内部 store。'}
+            </p>
+            <p>
+              {isEn
+                ? '• If IDE refreshes the token itself, this app detects the file change and syncs the new token back to its store (bidirectional sync).'
+                : '• 当 Kiro IDE 自己 refresh 后，本工具会监听磁盘文件变化并反向同步到 store（双向同步）。'}
+            </p>
+          </div>
+
+          {/* 主动续期开关（默认关闭） */}
+          <div className="flex items-center justify-between pt-3 border-t">
+            <div>
+              <p className="font-medium">
+                {isEn ? 'Proactive Token Renewal for IDE' : 'IDE 主动续期'}
+                <span className="ml-2 text-xs text-muted-foreground">
+                  ({isEn ? 'Advanced' : '进阶'})
+                </span>
+              </p>
+              <p className="text-sm text-muted-foreground">
+                {isEn
+                  ? `Renew IDE's active token ~${proactiveRenewalLeadMinutes} min before expiry, so Kiro IDE never refreshes by itself (eliminates all race conditions).`
+                  : `在 IDE 激活账号的 token 剩 ~${proactiveRenewalLeadMinutes} 分钟时抢先 refresh，让 Kiro IDE 永远不自己 refresh（彻底消除竞争条件）。`}
+              </p>
+            </div>
+            <Button
+              variant={proactiveRenewalEnabled ? 'default' : 'outline'}
+              size="sm"
+              onClick={async () => {
+                const result = await setProactiveRenewalEnabled(!proactiveRenewalEnabled)
+                if (!result.success && result.error) {
+                  alert(
+                    (isEn ? 'Failed to toggle proactive renewal: ' : '切换主动续期失败：') +
+                      result.error
+                  )
+                }
+              }}
+            >
+              {proactiveRenewalEnabled ? (isEn ? 'On' : '已开启') : (isEn ? 'Off' : '已关闭')}
+            </Button>
+          </div>
+          {proactiveRenewalEnabled && (
+            <div className="text-xs text-muted-foreground bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 rounded-lg p-3 space-y-1">
+              <p>
+                {isEn
+                  ? `• On: a single in-process timer renews token ${proactiveRenewalLeadMinutes} min before expiry; Kiro IDE keeps seeing fresh tokens (≥${60 - proactiveRenewalLeadMinutes} min remaining) and never invokes OIDC by itself.`
+                  : `• 启用后：账号管理器主进程会在 token 剩 ${proactiveRenewalLeadMinutes} 分钟时自动续期，Kiro IDE 始终看到剩余 ≥ ${60 - proactiveRenewalLeadMinutes} 分钟的 token，永远不会自己调 OIDC。`}
+              </p>
+              <p>
+                {isEn
+                  ? '• Only the IDE current active account is renewed. Switching accounts re-schedules the timer for the new active account.'
+                  : '• 仅对 IDE 当前激活账号续期。切号时 timer 会自动重新调度到新账号。'}
+              </p>
+              <p>
+                {isEn
+                  ? '• If a renewal fails (e.g. server outage), the timer stops; IDE\'s own refresh loop takes over as fallback.'
+                  : '• 续期失败时 timer 停止，由 IDE 自己的 refresh loop 接管（双向同步仍生效）。'}
+              </p>
+            </div>
+          )}
 
           {autoRefreshEnabled && (
             <>
@@ -646,7 +773,7 @@ export function SettingsPage() {
       </Card>
 
       {/* API 类型设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -698,7 +825,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 代理设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -728,7 +855,7 @@ export function SettingsPage() {
               <input
                 type="text"
                 className="flex-1 h-9 px-3 rounded-lg border bg-background text-sm font-mono focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
-                placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+                placeholder={isEn ? 'http://127.0.0.1:7890 or socks5://127.0.0.1:1080' : 'http://127.0.0.1:7890 或 socks5://127.0.0.1:1080'}
                 value={tempProxyUrl}
                 onChange={(e) => setTempProxyUrl(e.target.value)}
               />
@@ -749,7 +876,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 自动换号设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -816,7 +943,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 批量导入设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -847,7 +974,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 系统托盘设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -906,7 +1033,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 快捷键设置 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -962,7 +1089,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 机器码管理提示 */}
-      <Card className="border-0 shadow-sm bg-primary/5 border-primary/20 hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift bg-primary/5">
         <CardContent className="py-4">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -983,7 +1110,7 @@ export function SettingsPage() {
       </Card>
 
       {/* 数据管理 */}
-      <Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">
+      <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
@@ -1028,6 +1155,9 @@ export function SettingsPage() {
         </CardContent>
       </Card>
 
+      {/* 配置同步（不含敏感凭据，便于多设备共享） */}
+      <ConfigSyncCard isEn={isEn} />
+
       {/* 导出对话框 */}
       <ExportDialog
         open={showExportDialog}
@@ -1036,5 +1166,138 @@ export function SettingsPage() {
         selectedCount={0}
       />
     </div>
+  )
+}
+
+/**
+ * 配置同步卡片：把所有"非敏感"配置（代理池、Webhook、模板、限速、定时、各种 localStorage）打包导出/导入。
+ * 不包含：账号 token / 私密凭据。
+ */
+function ConfigSyncCard({ isEn }: { isEn: boolean }): React.ReactNode {
+  const proxyPool = useAccountsStore((s) => s.proxyPool)
+  const proxyPoolConfig = useAccountsStore((s) => s.proxyPoolConfig)
+
+  // 收集所有可同步的 localStorage key
+  const COLLECTED_LS_KEYS = [
+    'kiro-register-config',
+    'kiro-register-history',  // 可选：用户可决定要不要
+    'kiro-register-templates',
+    'kiro-register-ratelimit-enabled',
+    'kiro-register-ratelimit-max',
+    'kiro-register-autobackoff',
+    'kiro-register-dailyquota-limit',
+    'kiro-register-schedule-enabled',
+    'kiro-register-schedule-time',
+    'kiro-register-mixed-sources',
+    'kiro-webhooks',
+    'accounts_viewMode',
+    'accounts_activeGroupTab',
+    'systemLogs_displayLimit',
+    'kiro-diagnose-moemail',
+    'proxyLogs_timeRange',
+    'proxyLogs_displayLimit'
+  ]
+
+  const handleExport = (): void => {
+    const localData: Record<string, string> = {}
+    for (const key of COLLECTED_LS_KEYS) {
+      const v = localStorage.getItem(key)
+      if (v != null) localData[key] = v
+    }
+    const payload = {
+      version: 1,
+      type: 'kiro-account-manager-config',
+      exportedAt: Date.now(),
+      // 代理池条目（不含敏感账号）
+      proxyPool: Object.fromEntries(proxyPool),
+      proxyPoolConfig,
+      // 各种 localStorage
+      localStorage: localData
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `kiro-config-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const handleImport = async (): Promise<void> => {
+    const fileData = await window.api.importFromFile()
+    if (!fileData || fileData.format !== 'json') {
+      alert(isEn ? 'Please select a JSON file' : '请选择 JSON 文件')
+      return
+    }
+    try {
+      const payload = JSON.parse(fileData.content)
+      if (payload.type !== 'kiro-account-manager-config') {
+        alert(isEn ? 'Not a valid config file' : '不是有效的配置文件')
+        return
+      }
+      if (!confirm(isEn ? 'This will overwrite proxy pool / webhooks / templates. Continue?' : '这将覆盖代理池 / Webhook / 模板等配置，确定继续？')) {
+        return
+      }
+
+      // 恢复 localStorage
+      if (payload.localStorage && typeof payload.localStorage === 'object') {
+        for (const [k, v] of Object.entries(payload.localStorage)) {
+          if (COLLECTED_LS_KEYS.includes(k) && typeof v === 'string') {
+            try { localStorage.setItem(k, v) } catch { /* ignore */ }
+          }
+        }
+      }
+
+      // 恢复代理池（通过 store 接口）
+      if (payload.proxyPool && typeof payload.proxyPool === 'object') {
+        const store = useAccountsStore.getState()
+        store.clearProxyPool()
+        // 直接通过 set 重建 Map（绕过 addProxy 的解析步骤，保留原 ID）
+        useAccountsStore.setState({
+          proxyPool: new Map(Object.entries(payload.proxyPool as Record<string, never>)) as Parameters<typeof useAccountsStore.setState>[0] extends infer T ? (T extends { proxyPool: infer P } ? P : never) : never
+        } as Parameters<typeof useAccountsStore.setState>[0])
+      }
+      if (payload.proxyPoolConfig) {
+        useAccountsStore.getState().setProxyPoolConfig(payload.proxyPoolConfig)
+      }
+
+      alert(isEn
+        ? 'Config imported. Please restart the app to fully apply.'
+        : '配置已导入。建议重启应用以完全生效。'
+      )
+    } catch (e) {
+      alert((isEn ? 'Import failed: ' : '导入失败: ') + (e instanceof Error ? e.message : String(e)))
+    }
+  }
+
+  return (
+    <Card className="hover-lift">
+      <CardHeader className="pb-2">
+        <CardTitle className="text-base flex items-center gap-3">
+          <div className="p-2 rounded-lg bg-primary/10">
+            <Repeat className="h-4 w-4 text-primary" />
+          </div>
+          {isEn ? 'Configuration Sync' : '配置同步'}
+        </CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <p className="text-sm text-muted-foreground">
+          {isEn
+            ? 'Export all non-sensitive settings (proxy pool, webhooks, templates, rate limits, UI preferences) to a file, for backup or multi-device sync. Does NOT include account tokens or credentials.'
+            : '导出所有"非敏感"配置（代理池、Webhook、注册模板、限速、UI 偏好等）到文件，便于备份或多设备同步。不含账号 Token 与凭据。'
+          }
+        </p>
+        <div className="flex gap-2">
+          <Button variant="outline" size="sm" onClick={handleExport}>
+            <Download className="h-4 w-4 mr-2" />
+            {isEn ? 'Export Config' : '导出配置'}
+          </Button>
+          <Button variant="outline" size="sm" onClick={handleImport}>
+            <Upload className="h-4 w-4 mr-2" />
+            {isEn ? 'Import Config' : '导入配置'}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   )
 }

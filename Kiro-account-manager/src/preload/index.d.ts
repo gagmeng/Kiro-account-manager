@@ -39,6 +39,12 @@ interface AccountData {
     accountId?: string
     accountEmail?: string
   }>
+  // 代理池
+  proxyPool?: Record<string, unknown>
+  proxyPoolConfig?: unknown
+  proxyPoolCursor?: number
+  /** 账号-代理绑定映射 */
+  accountProxyBindings?: Record<string, string>
 }
 
 interface RefreshResult {
@@ -47,8 +53,21 @@ interface RefreshResult {
     accessToken: string
     refreshToken?: string
     expiresIn: number
+    /**
+     * 反代在 main 进程中是否已经把新 token 同步写入 ~/.aws/sso/cache/kiro-auth-token.json。
+     * 仅当该账号被识别为 Kiro IDE 当前激活账号时才会同步，否则为 false。
+     */
+    syncedToIde?: boolean
+    /** 未同步到 IDE 时的原因描述（用于 UI 提示） */
+    syncSkipReason?: string
   }
   error?: { message: string }
+}
+
+/** Kiro IDE 自己 refresh 完写回 token 文件、被反代检测到后通知 renderer 的 payload */
+interface KiroIdeTokenChangedPayload {
+  accountId: string
+  reason: string
 }
 
 interface BonusData {
@@ -174,7 +193,44 @@ interface KiroApi {
     authMethod?: 'IdC' | 'social'
     provider?: 'BuilderId' | 'Enterprise' | 'Github' | 'Google' | 'IAM_SSO'
     profileArn?: string
-  }) => Promise<{ success: boolean; error?: string }>
+    /** 反代 store 里的 account.id，用于 main 进程记忆 lastSwitchedAccountId 供 watcher 反向同步 */
+    accountId?: string
+  }) => Promise<{
+    success: boolean
+    error?: string
+    /** 切号前 main 进程会做一次 refresh；这是 OIDC 返回的最新凭证，renderer 应据此更新 store */
+    refreshedCredentials?: {
+      accessToken: string
+      refreshToken: string
+      expiresIn: number
+    }
+  }>
+
+  /**
+   * 订阅 Kiro IDE 自己 refresh token 后反代检测到的事件，回调里通常应该重新 loadAccounts
+   * 让 UI 显示最新 expiresAt。返回 unsubscribe 函数。
+   */
+  onKiroIdeTokenChanged: (callback: (data: KiroIdeTokenChangedPayload) => void) => () => void
+
+  /**
+   * 开启/关闭"主动续期"功能。
+   * 开启后账号管理器会在 IDE 当前激活账号 token 剩 ~15 分钟时抢先 refresh + 写磁盘，
+   * 让 IDE 永远拿到剩余时间充足的 token，IDE 内部的 refresh loop 不会被触发，
+   * 彻底消除 IDE 与账号管理器同时 refresh 撞车的可能。
+   */
+  setProactiveRenewalEnabled: (enabled: boolean) => Promise<{
+    success: boolean
+    enabled?: boolean
+    error?: string
+  }>
+
+  /** 读取主动续期开关当前状态 + 提前续期的分钟数 */
+  getProactiveRenewalEnabled: () => Promise<{
+    success: boolean
+    enabled: boolean
+    leadTimeMinutes?: number
+    error?: string
+  }>
 
   // 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
   switchAccountCli: (credentials: {
@@ -401,7 +457,7 @@ interface KiroApi {
   onSocialAuthCallback: (callback: (data: { code?: string; state?: string; error?: string }) => void) => () => void
 
   // 代理设置
-  setProxy: (enabled: boolean, url: string) => Promise<{ success: boolean; error?: string }>
+  setProxy: (enabled: boolean, url: string) => Promise<{ success: boolean; error?: string; normalizedUrl?: string }>
 
   // ============ 机器码管理 API ============
 
@@ -539,7 +595,7 @@ interface KiroApi {
   // ============ Kiro API 反代服务器 ============
 
   // 启动反代服务器
-  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }) => Promise<{ success: boolean; port?: number; error?: string }>
+  proxyStart: (config?: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; logRequests?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; modelThinkingMode?: Record<string, boolean>; thinkingOutputFormat?: 'auto' | 'reasoning_content' | 'thinking' | 'think' }) => Promise<{ success: boolean; port?: number; error?: string }>
 
   // 停止反代服务器
   proxyStop: () => Promise<{ success: boolean; error?: string }>
@@ -566,7 +622,15 @@ interface KiroApi {
   proxyGetLogsCount: () => Promise<number>
 
   // 更新反代服务器配置
-  proxyUpdateConfig: (config: { port?: number; host?: string; apiKey?: string; enableMultiAccount?: boolean; selectedAccountIds?: string[]; logRequests?: boolean; logStreamEvents?: boolean; autoStart?: boolean; maxRetries?: number; preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'; autoContinueRounds?: number; enableServerSideToolAutoContinue?: boolean; clientDrivenToolExecution?: boolean; disableTools?: boolean; payloadSizeLimitKB?: number; autoSwitchOnQuotaExhausted?: boolean; accountSelectionStrategy?: 'round-robin' | 'sticky'; modelMappings?: Array<{ id: string; name: string; enabled: boolean; type: 'replace' | 'alias' | 'loadbalance'; sourceModel: string; targetModels: string[]; weights?: number[]; priority: number; apiKeyIds?: string[] }> }) => Promise<{ success: boolean; config?: unknown; error?: string }>
+  proxyUpdateConfig: (config: Record<string, unknown>) => Promise<{ success: boolean; config?: unknown; error?: string }>
+
+  // ============ v1.8 反代安全 / 可观测 IPC ============
+  proxySelfSignedCertInfo: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
+  proxySelfSignedCertRegenerate: () => Promise<{ success: boolean; cert?: string; key?: string; fingerprint?: string; notBefore?: number; notAfter?: number; subject?: string; altNames?: string[]; error?: string }>
+  proxyNeedsRestart: () => Promise<{ needsRestart: boolean }>
+  proxyRestart: () => Promise<{ success: boolean; error?: string }>
+  proxyAuditLog: () => Promise<{ entries: Array<{ ts: number; type: string; data: Record<string, unknown> }> }>
+  onProxyWebhookTrigger: (callback: (event: string, payload: Record<string, unknown>) => void) => (() => void)
 
   // 添加账号到反代池
   proxyAddAccount: (account: { id: string; email?: string; accessToken: string; refreshToken?: string; profileArn?: string; expiresAt?: number; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; provider?: string; machineId?: string }) => Promise<{ success: boolean; accountCount?: number; error?: string }>
@@ -582,6 +646,9 @@ interface KiroApi {
 
   // 重置反代池状态
   proxyResetPool: () => Promise<{ success: boolean; error?: string }>
+
+  // 手动解除账号封禁标记
+  proxyClearAccountSuspended: (accountId: string) => Promise<{ success: boolean; error?: string }>
 
   // 刷新模型缓存
   proxyRefreshModels: () => Promise<{ success: boolean; error?: string }>
@@ -623,6 +690,9 @@ interface KiroApi {
 
   // 监听反代状态变化事件
   onProxyStatusChange: (callback: (status: { running: boolean; port: number }) => void) => () => void
+
+  // 监听反代账号被封禁事件（TEMPORARILY_SUSPENDED / AccountSuspendedException）
+  onProxyAccountSuspended: (callback: (info: { id: string; email?: string; reason: string; message: string; suspendedAt: number }) => void) => () => void
 
   // ============ Usage API 类型设置 ============
 
@@ -720,6 +790,16 @@ interface KiroApi {
   // 监听 K-Proxy MITM 拦截事件
   onKproxyMitm: (callback: (info: { host: string; modified: boolean }) => void) => () => void
 
+  // ============ 自定义 titlebar API ============
+  window: {
+    minimize: () => void
+    maximizeToggle: () => void
+    close: () => void
+    isMaximized: () => Promise<boolean>
+    getPlatform: () => Promise<NodeJS.Platform>
+    onMaximizeChange: (callback: (isMaximized: boolean) => void) => () => void
+  }
+
   // ============ 托盘相关 API ============
 
   // 获取托盘设置
@@ -786,6 +866,8 @@ interface KiroApi {
 
   registrationStartAuto: (config: {
     proxy?: string
+    upstreamProxy?: string
+    strictProxy?: boolean
     moEmailBaseURL?: string
     moEmailAPIKey?: string
     useOutlook?: boolean
@@ -794,6 +876,8 @@ interface KiroApi {
     tempMailPlusEmail?: string
     tempMailPlusEpin?: string
     tempMailPlusDomain?: string
+    useProton?: boolean
+    protonEmail?: string
     password?: string
     fullName?: string
     taskId?: string
@@ -813,7 +897,99 @@ interface KiroApi {
 
   registrationStatus: () => Promise<{ inProgress: boolean }>
 
+  protonOpenLogin: (proxy?: string) => Promise<{ success: boolean; loggedIn: boolean; error?: string }>
+
+  protonLoginStatus: (proxy?: string) => Promise<{ loggedIn: boolean }>
+
+  protonClose: () => Promise<{ success: boolean }>
+
+  // 代理池验活
+  proxyPoolValidate: (params: {
+    url: string
+    testUrl?: string
+    timeoutMs?: number
+    upstreamProxy?: string
+  }) => Promise<{ success: boolean; latencyMs?: number; externalIp?: string; error?: string }>
+
+  proxyPoolDiagnoseChain: (params: {
+    targetUrl: string
+    upstreamProxy: string
+    testHost?: string
+    testPort?: number
+  }) => Promise<{
+    success: boolean
+    error?: string
+    diagnose?: {
+      upstreamReachable: boolean
+      upstreamError?: string
+      upstreamRtMs?: number
+      targetReachable: boolean
+      targetError?: string
+      targetRtMs?: number
+      targetStatus?: number
+      targetStatusText?: string
+      targetBodySnippet?: string
+      endToEndOk?: boolean
+      endToEndError?: string
+      endToEndRtMs?: number
+    }
+  }>
+
+  // 诊断：通用 HTTP 探测
+  diagnoseHttpProbe: (params: { url: string; method?: 'GET' | 'HEAD'; timeoutMs?: number }) => Promise<{
+    success: boolean
+    latencyMs?: number
+    status?: number
+    error?: string
+  }>
+
+  // 账号-代理绑定（反代分桶）
+  accountSetProxyBinding: (accountId: string, proxyUrl: string | undefined) => Promise<{ success: boolean }>
+
+  // 一键诊断
+  diagnoseRun: (params: {
+    proxyUrl?: string
+    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
+  }) => Promise<{ results: Array<{ id: string; label: string; url: string; success: boolean; httpStatus?: number; latencyMs?: number; error?: string }> }>
+
+  // 账号测活：指定账号 + 模型走反代逻辑发测试消息
+  diagnoseAccountLiveness: (params: {
+    account: {
+      id?: string; email?: string; accessToken?: string; refreshToken?: string
+      clientId?: string; clientSecret?: string; region?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'; provider?: string
+      profileArn?: string; machineId?: string; expiresAt?: number; proxyUrl?: string
+    }
+    model?: string
+    message?: string
+    timeoutMs?: number
+  }) => Promise<{
+    success: boolean
+    latencyMs: number
+    model?: string
+    content?: string
+    usage?: { inputTokens: number; outputTokens: number; credits: number }
+    error?: string
+  }>
+
   onRegistrationLog: (callback: (msg: string) => void) => () => void
+
+  onRegistrationStep: (callback: (data: {
+    taskId?: string
+    event: {
+      name:
+        | 'init' | 'proxy-chain-ready' | 'tls-ready' | 'exit-ip'
+        | 'oidc' | 'device' | 'email-created'
+        | 'portal' | 'workflow-init' | 'submit-email'
+        | 'signup' | 'send-otp' | 'waiting-otp' | 'otp-received'
+        | 'create-identity' | 'set-password' | 'sso-workflow' | 'sso-token'
+        | 'verify-alive' | 'done'
+      ts: number
+      email?: string
+      exitIp?: string
+      extra?: Record<string, unknown>
+    }
+  }) => void) => () => void
 
   onRegistrationComplete: (callback: (result: {
     status: 'success' | 'failed'

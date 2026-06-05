@@ -382,6 +382,10 @@ export interface ProxyAccount {
   profileArn?: string
   expiresAt?: number
   machineId?: string  // 账户绑定的设备 ID（64位十六进制）
+  /** 账号绑定的出口代理 URL（http/https）；为空则使用全局代理逻辑 */
+  proxyUrl?: string
+  /** 账号所属分组 ID；与 multiAccountSelectionMode='groups' + multiAccountGroupIds 配合做轮询分组过滤 */
+  groupId?: string
   // 运行时状态
   lastUsed?: number
   requestCount?: number
@@ -393,6 +397,12 @@ export interface ProxyAccount {
   quotaLimit?: number
   quotaExhaustedAt?: number // 配额耗尽时间戳
   quotaResetAt?: number // 下次配额重置时间
+  // 长期封禁追踪（区分于临时 errorCount 冷却）
+  // Kiro 后端 TEMPORARILY_SUSPENDED / AccountSuspendedException 等风控触发时设置
+  // 需要联系 AWS Support 人工解封，账号池会持续跳过直到 clearSuspended
+  suspendedAt?: number       // 封禁时间戳
+  suspendReason?: string     // 封禁原因 (如 'TEMPORARILY_SUSPENDED')
+  suspendMessage?: string    // 封禁完整错误消息 (含联系链接)
 }
 
 // API Key 格式类型
@@ -485,22 +495,65 @@ export interface ProxyConfig {
   tls?: TlsConfig
   // 自动启动
   autoStart?: boolean
-  // 工具调用后自动继续（最大轮数）
-  autoContinueRounds?: number
-  enableServerSideToolAutoContinue?: boolean
   clientDrivenToolExecution?: boolean
   // 禁用工具调用（移除 tools 参数）
   disableTools?: boolean
-  // Payload 大小限制（KB），超过时截断工具结果
+  // Payload 大小限制（KB），超过时截断工具结果（byte 维度）
   payloadSizeLimitKB?: number
+  // Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
+  // 关闭时后端不再裁剪任何旧消息，超出 context window 由 Kiro 后端原样返回错误
+  enableTokenBufferReserve?: boolean
+  // Token buffer reserve（仅在 enableTokenBufferReserve=true 时生效）
+  // effective limit = model.maxInputTokens - buffer
+  // 默认 20K：覆盖 system + tools + current message + output + 估算偏差
+  tokenBufferReserve?: number
   // 单账号模式下额度耗尽自动切换到下一个账号
   autoSwitchOnQuotaExhausted?: boolean
   // 多账号选择策略 (仅 enableMultiAccount=true 时生效)
   // - round-robin: 每次请求成功后切到下一个账号 (默认, 负载均衡)
   // - sticky: 一个账号成功就粘住, 直到失败才切换 (保留 prompt cache, 牺牲均衡)
   accountSelectionStrategy?: 'round-robin' | 'sticky'
+  // 多账号轮询范围 (仅 enableMultiAccount=true 时生效)
+  // - 'all': 使用所有 active 账号（默认）
+  // - 'groups': 仅使用 multiAccountGroupIds 选中分组的账号；可包含特殊值 '__ungrouped__' 表示未分组账号
+  multiAccountSelectionMode?: 'all' | 'groups'
+  multiAccountGroupIds?: string[]
   // 模型映射规则
   modelMappings?: ModelMappingRule[]
+
+  // ============ 安全 / 限流 / 可观测（v1.8 新增） ============
+  /** 入站请求体最大字节数（默认 10MB）。超过返回 413 */
+  maxRequestBodyBytes?: number
+  /** 允许访问的客户端 IP 列表（CIDR 或单 IP）；空数组或未设 = 不限制 */
+  allowedIPs?: string[]
+  /** 拒绝访问的客户端 IP 列表（CIDR 或单 IP）；优先级高于 allowedIPs */
+  deniedIPs?: string[]
+  /** 当绑定 host 是 0.0.0.0/外网接口时，是否允许无 API Key 启动（默认 false 拒绝） */
+  allowExternalWithoutApiKey?: boolean
+  /** 按 API Key（或匿名时按 IP）的请求频率限制：每分钟最大请求数。0=不限制 */
+  rateLimitPerKeyPerMinute?: number
+  /** 客户端会话粘性：true 时同一 session hint 总路由到同一账号子集 */
+  sessionAffinityEnabled?: boolean
+  /** keep-alive 连接空闲超时（毫秒），默认 65s */
+  keepAliveTimeoutMs?: number
+  /** request headers 接收超时（毫秒），默认 60s */
+  headersTimeoutMs?: number
+  /** recentRequests 保留条数（默认 100，最多 10000） */
+  recentRequestsLimit?: number
+  /** 是否暴露 /metrics（Prometheus 文本格式） */
+  enableMetrics?: boolean
+  /**
+   * P2-21 API Key 与账号的精细绑定：apiKey id → 允许使用的账号 ID 数组（白名单）
+   * 未配置或空数组 = 该 API Key 可使用所有账号；
+   * 兼容旧名 apiKeyGroupBindings（按 group 绑定，需配合 group 同步）
+   */
+  apiKeyAccountBindings?: Record<string, string[]>
+  /** @deprecated 改用 apiKeyAccountBindings；保留以兼容老配置 */
+  apiKeyGroupBindings?: Record<string, string[]>
+  /** HTTP + HTTPS 双端口：启用 TLS 时，仍同时监听 HTTP 端口在 fallbackPort */
+  fallbackPort?: number
+  /** 启用审计日志（管理 API 操作、config 变更） */
+  enableAuditLog?: boolean
 }
 
 export interface TlsConfig {

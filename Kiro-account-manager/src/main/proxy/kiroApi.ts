@@ -1,6 +1,6 @@
 // Kiro API 调用核心模块
 import { v4 as uuidv4 } from 'uuid'
-import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import type {
   KiroPayload,
   KiroUserInputMessage,
@@ -17,7 +17,15 @@ import type {
 } from './types'
 import { proxyLogger } from './logger'
 import { getKProxyService } from '../kproxy'
-import { getSystemProxy } from './systemProxy'
+import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
+import {
+  countTokens,
+  getModelContextLength,
+  setModelContextWindow,
+  getModelContextWindow
+} from './tokenCounter'
+// 重新导出以保持向后兼容（proxyServer.ts 等模块仍 from './kiroApi' 导入）
+export { setModelContextWindow, getModelContextWindow }
 
 // 是否使用 K-Proxy 代理发送 API 请求（从主进程导入）
 let useKProxyForApi = false
@@ -37,30 +45,89 @@ export function setPayloadSizeLimitKB(limitKB: number): void {
   payloadSizeLimitKB = Math.max(256, Math.min(10240, limitKB))
 }
 
-// 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
-function getNetworkAgent(): ProxyAgent | undefined {
+// Token buffer reserve 开关（默认 false = 完全跳过 trimHistoryByTokens）
+// 关闭时后端不再裁剪任何旧消息，超出 context window 由 Kiro 后端原样返回错误
+let enableTokenBufferReserve = false
+export function setEnableTokenBufferReserve(enabled: boolean): void {
+  enableTokenBufferReserve = !!enabled
+}
+export function getEnableTokenBufferReserve(): boolean {
+  return enableTokenBufferReserve
+}
+
+// Token buffer reserve（仅在 enableTokenBufferReserve=true 时生效）
+// 为 model context window 预留的余量，覆盖 system + tools + current + output + 估算偏差 + schema 开销
+// 默认 20K：开关启用后的合理初始值（200K → effective 180K, 1M → effective 980K）
+let tokenBufferReserve = 20000
+export function setTokenBufferReserve(tokens: number): void {
+  tokenBufferReserve = Math.max(5000, Math.min(150000, tokens))
+}
+export function getTokenBufferReserve(): number {
+  return tokenBufferReserve
+}
+
+// 根据 modelId 和 buffer 计算 effective token limit
+// 仅在 enableTokenBufferReserve=true 时被调用
+// 查不到 model 时 fallback 到 200K context (Claude 默认)
+function getEffectiveTokenLimit(modelId?: string): number {
+  // 复用 getModelContextLength（支持 cache 命中 → 模糊匹配 → 关键词兜底）
+  const ctx = modelId ? getModelContextLength(modelId) : 200000
+  return Math.max(8000, ctx - tokenBufferReserve)
+}
+
+// Token 估算 (UTF-8 字节数 / 3.5，对中英混合场景做安全偏保守估算)
+// 比真实 cl100k_base tokenizer 略偏高 (10-20%), 用于触发裁剪阈值是安全的
+function estimateTokensFromString(str: string): number {
+  return Math.ceil(Buffer.byteLength(str, 'utf-8') / 3.5)
+}
+
+function estimatePayloadTokens(payload: KiroPayload): number {
+  return estimateTokensFromString(JSON.stringify(payload))
+}
+
+/**
+ * 获取网络代理 agent
+ * 优先级（从高到低）：
+ *   1. 账号自身绑定的 proxyUrl（实现"N 个号一个 IP"分桶反代）
+ *   2. K-Proxy（如果启用）
+ *   3. 环境变量代理
+ *   4. 系统代理
+ *
+ * 传入 account 让账号级代理覆盖全局；不传则走全局逻辑。
+ */
+function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
+  // 1. 账号专属代理：实现"N 个账号共用 1 个 IP"的分桶反代
+  if (account?.proxyUrl) {
+    const agent = safeCreateProxyAgent(account.proxyUrl)
+    if (agent) {
+      proxyLogger.debug('KiroAPI', `Using account-bound proxy for ${account.email || account.id}`)
+      return agent
+    }
+  }
+  // 2. K-Proxy
   if (useKProxyForApi) {
     const kproxyService = getKProxyService()
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      const agent = safeCreateProxyAgent(proxyUrl)
+      if (agent) return agent
     }
   }
+  // 3. 环境变量
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  if (envProxy) {
-    return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  const systemProxy = getSystemProxy()
-  if (systemProxy) {
-    return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  return undefined
+  const envAgent = safeCreateProxyAgent(envProxy)
+  if (envAgent) return envAgent
+  // 4. 系统代理
+  return safeCreateProxyAgent(getSystemProxy())
 }
 
-// 使用代理的 fetch 函数
-async function fetchWithProxy(url: string, options: RequestInit): Promise<Response> {
-  const agent = getNetworkAgent()
+/**
+ * 使用代理的 fetch 函数
+ * 传入 account 时会优先使用账号绑定的代理（账号-代理 N:1 分桶）
+ */
+async function fetchWithProxy(url: string, options: RequestInit, account?: ProxyAccount): Promise<Response> {
+  const agent = getNetworkAgent(account)
   if (agent) {
     proxyLogger.debug('KiroAPI', `Using proxy agent: ${agent.constructor.name}`)
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
@@ -86,7 +153,7 @@ const KIRO_ENDPOINTS = [
   },
   {
     url: 'https://q.us-east-1.amazonaws.com/SendMessageStreaming',
-    origin: 'AmazonQ',
+    origin: 'CLI',
     amzTarget: 'AmazonQDeveloperStreamingService.SendMessage',
     name: 'AmazonQCLI'
   }
@@ -119,14 +186,36 @@ const KIRO_CLI_AMZ_USER_AGENT = `aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os
 const AGENT_MODE_SPEC = 'spec' // IDE 模式
 const AGENT_MODE_VIBE = 'vibe' // CLI 模式
 
-const KIRO_BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
-const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+// profileArn 决策中心已迁移到 ../kiroAuthSync，反代和账号管理器主进程共用同一份定义，
+// 防止多处常量漂移。注意 KIRO_BUILDER_ID_PLACEHOLDER_ARN 仍以本模块为出口 re-export，
+// 这样 main/index.ts 等老 import 路径不需要改。
+import {
+  KIRO_BUILDER_ID_PLACEHOLDER_ARN as _KIRO_BUILDER_ID_PLACEHOLDER_ARN,
+  KIRO_SOCIAL_PROFILE_ARN,
+  isPlaceholderProfileArn as _isPlaceholderProfileArn
+} from '../kiroAuthSync'
 
-function resolveProfileArn(account: ProxyAccount): string {
-  if (account.profileArn) return account.profileArn
-  if (account.provider === 'Github' || account.provider === 'Google') return KIRO_SOCIAL_PROFILE_ARN
-  return KIRO_BUILDER_ID_PROFILE_ARN
+export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = _KIRO_BUILDER_ID_PLACEHOLDER_ARN
+export const isPlaceholderProfileArn = _isPlaceholderProfileArn
+
+/**
+ * 反代调 Kiro API 时使用的 profileArn 决策。
+ * BuilderId 使用占位符 ARN，Social 使用固定 ARN。
+ * 注意：流式端点（generateAssistantResponse / SendMessageStreaming）对占位符 ARN 会 403，
+ * 需在 callKiroApiStream 中额外剥离。
+ */
+function resolveProfileArn(account: ProxyAccount): string | undefined {
+  if (account.profileArn && !isPlaceholderProfileArn(account.profileArn)) {
+    return account.profileArn
+  }
+  if (account.authMethod === 'social' || account.provider === 'Github' || account.provider === 'Google') {
+    return KIRO_SOCIAL_PROFILE_ARN
+  }
+  return KIRO_BUILDER_ID_PLACEHOLDER_ARN
 }
+
+// 兼容 SDK 部分调用仍想知道社交 ARN 的场景（极少；保留 export 不破坏外部 import）
+export { KIRO_SOCIAL_PROFILE_ARN }
 
 // Agentic 模式系统提示 - 防止大文件写入超时
 const AGENTIC_SYSTEM_PROMPT = `# CRITICAL: CHUNKED WRITE PROTOCOL (MANDATORY)
@@ -186,10 +275,30 @@ const MODEL_ID_MAP: Record<string, string> = {
   'default': 'claude-sonnet-4.5'
 }
 
+/**
+ * 归一化 Claude 版本号：把版本号里的短横线转成点号。
+ *
+ * 背景：部分客户端（如 Claude Code）不允许模型名里出现 "."，会把 "claude-opus-4.6"
+ * 写成 "claude-opus-4-6"，若原样透传给 Kiro 会被解析成 "claude-opus-4"（丢掉 minor），
+ * 导致 1M 上下文等特性设置失败。这里把 claude-{family}-{major}-{minor} 的最后一段
+ * 版本短横转成点号，兼容未来任意新版本（4.6 / 4.7 / 5.0 ...）。
+ *
+ * 仅当 minor 是 1~2 位数字且其后不是更多数字时才转换，避免误伤日期快照后缀
+ * （如 claude-sonnet-4-20250514 不会被改）。
+ */
+function normalizeClaudeVersion(modelId: string): string {
+  return modelId.replace(
+    /^(claude-(?:sonnet|haiku|opus))-(\d+)-(\d{1,2})(?=$|[^\d])/i,
+    '$1-$2.$3'
+  )
+}
+
 export function mapModelId(model: string): string {
-  const modelId = model.trim()
+  let modelId = model.trim()
   if (!modelId) return MODEL_ID_MAP.default
   if (isCodeWhispererModelId(modelId)) return modelId
+  // 0) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
+  modelId = normalizeClaudeVersion(modelId)
   const lower = modelId.toLowerCase()
   // 1) 显式 alias 映射优先
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
@@ -240,7 +349,7 @@ function isCodeWhispererModelId(modelId: string): boolean {
 }
 
 function getModelCacheKey(account: ProxyAccount): string {
-  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account)}`
+  return `${account.id}:${account.region || 'us-east-1'}:${resolveProfileArn(account) ?? 'no-arn'}`
 }
 
 async function getCachedCodeWhispererModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
@@ -738,6 +847,49 @@ function sanitizeConversation(messages: KiroHistoryMessage[]): KiroHistoryMessag
   return sanitized
 }
 
+// 按 token 估算成对裁剪 history 最旧消息 (避免后端 CONTENT_LENGTH_EXCEEDS_THRESHOLD)
+// 切点保证不破坏 toolUse↔toolResult 配对：assistant(toolUse) 必须连同后续 user(toolResult) 一起裁
+// 裁剪后用 ensureStartsWithUserMessage 兜底重新规范化
+function trimHistoryByTokens(payload: KiroPayload, maxTokens: number): { trimmed: number; finalTokens: number; iterations: number } {
+  let history = payload.conversationState.history
+  if (!history || history.length === 0) {
+    return { trimmed: 0, finalTokens: estimatePayloadTokens(payload), iterations: 0 }
+  }
+
+  let totalTrimmed = 0
+  let iterations = 0
+  let currentTokens = estimatePayloadTokens(payload)
+  const MAX_ITERATIONS = 100 // 防止极端情况死循环
+
+  while (currentTokens > maxTokens && history.length >= 4 && iterations < MAX_ITERATIONS) {
+    iterations++
+    // 计算安全切点：从 index 0 开始至少裁掉 1 组 (user+assistant)，并连带 toolUse/toolResult 配对
+    let cutAt = 0
+    while (cutAt < history.length - 2) {
+      const msg = history[cutAt]
+      // assistant(toolUse) → 下一条 user(toolResult) 必须一起裁，避免配对断裂
+      if (isAssistantResponseMessage(msg) && hasToolUses(msg)) {
+        cutAt += 2
+      } else {
+        cutAt += 1
+      }
+      if (cutAt >= 2) break
+    }
+
+    if (cutAt === 0) break // 无法继续裁剪
+
+    history = history.slice(cutAt)
+    totalTrimmed += cutAt
+
+    // 裁剪后 history 可能以 assistant 起头 → 补 HELLO 重新规范
+    history = ensureStartsWithUserMessage(history)
+    payload.conversationState.history = history
+    currentTokens = estimatePayloadTokens(payload)
+  }
+
+  return { trimmed: totalTrimmed, finalTokens: currentTokens, iterations }
+}
+
 // ============= 构建 Kiro API 请求负载（参考 Kiro 官方实现）=============
 
 export function buildKiroPayload(
@@ -871,7 +1023,23 @@ export function buildKiroPayload(
     payload.additionalModelRequestFields = additionalModelRequestFields
   }
 
-  // 工具结果裁剪：payload 超过限制时，从最旧的历史 toolResult 开始截断内容
+  // ====== 第一阶段：按 token 估算成对裁剪旧 history ======
+  // 避免 Kiro 后端 CONTENT_LENGTH_EXCEEDS_THRESHOLD（token 维度的拒绝）
+  // 注意：byte size 充足但 token 超限是常见情况（长对话+大量小消息）
+  // effectiveLimit 按模型 context window 自动算：ctx - tokenBufferReserve（开关启用时，默认 20K）
+  // 例：sonnet-4.5 (200K) → 180K, sonnet-4.5 with 1M beta → 980K
+  // 开关关闭时完全跳过，超出 context window 由 Kiro 后端原样返回错误
+  if (enableTokenBufferReserve) {
+    const effectiveTokenLimit = getEffectiveTokenLimit(modelId)
+    const tokenTrimResult = trimHistoryByTokens(payload, effectiveTokenLimit)
+    if (tokenTrimResult.trimmed > 0) {
+      const modelCtx = getModelContextLength(modelId)
+      console.log(`[KiroPayload] Trimmed ${tokenTrimResult.trimmed} oldest history messages by token estimate (≈${tokenTrimResult.finalTokens.toLocaleString()} / ${effectiveTokenLimit.toLocaleString()} tokens [model ctx ${modelCtx.toLocaleString()} - buffer ${tokenBufferReserve.toLocaleString()}], ${tokenTrimResult.iterations} iter)`)
+    }
+  }
+
+  // ====== 第二阶段：按 byte 截断 tool result 内容 ======
+  // 避免 HTTP body 过大被 Kiro 网关拒绝
   // 用户可在高级设置中调整限制值（默认 1536KB = 1.5MB）
   const PAYLOAD_SIZE_LIMIT = (payloadSizeLimitKB || 1536) * 1024
   const TOOL_RESULT_TRUNCATE_LENGTH = 4000
@@ -1056,7 +1224,13 @@ export async function callKiroApiStream(
     try {
       throwIfAborted(signal)
       const requestPayload = clonePayload(payload)
-      requestPayload.profileArn = resolveProfileArn(account)
+      // 流式端点对 BuilderId 占位符 ARN 返回 403，仅传真实 ARN 或 Social ARN
+      const resolvedArn = resolveProfileArn(account)
+      if (resolvedArn && !isPlaceholderProfileArn(resolvedArn)) {
+        requestPayload.profileArn = resolvedArn
+      } else {
+        delete requestPayload.profileArn
+      }
       const requestedModelId = getPayloadModelId(requestPayload)
       if (endpoint.name === 'CodeWhisperer') {
         applyPayloadModelId(requestPayload, await resolveCodeWhispererModelId(account, requestedModelId, signal))
@@ -1087,7 +1261,7 @@ export async function callKiroApiStream(
       console.log(`[KiroAPI]   - Agent mode: ${headers['x-amzn-kiro-agent-mode']}`)
       console.log(`[KiroAPI]   - Payload size: ${payloadStr.length} bytes`)
       
-      const agent = getNetworkAgent()
+      const agent = getNetworkAgent(account)
       if (agent) proxyLogger.debug('KiroAPI', `Stream request via proxy to ${endpoint.name}`)
       const response = agent
         ? await undiciFetch(endpoint.url, { method: 'POST', headers, body: payloadStr, signal, dispatcher: agent } as UndiciRequestInit) as unknown as Response
@@ -1114,9 +1288,9 @@ export async function callKiroApiStream(
       }
 
       // 解析 Event Stream
-      // 计算输入字符长度用于估算 input tokens
+      // 传入 modelId + payloadStr 用于精确 token 计算（contextUsage 反推 + tiktoken）
       const inputChars = payloadStr.length
-      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal)
+      await parseEventStream(response.body!, onChunk, onComplete, onError, inputChars, signal, requestedModelId, payloadStr)
       return
     } catch (error) {
       if (signal?.aborted) {
@@ -1188,20 +1362,10 @@ interface ToolUseState {
   inputBuffer: string
 }
 
-// Token 估算（仅作兜底，Kiro 后端返回真实值时不使用）
-// 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
+// Token 估算（被 promptCacheTracker 等模块使用，用于 cache 块大小判定）
+// 优先使用 tiktoken cl100k_base 精确计算（±5%），失败时自动降级到字符系数（±15%）
 export function estimateTokens(text: string): number {
-  let cjkChars = 0
-  let otherChars = 0
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i)
-    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) || (code >= 0xF900 && code <= 0xFAFF)) {
-      cjkChars++
-    } else {
-      otherChars++
-    }
-  }
-  return Math.round(cjkChars * 0.6 + otherChars * 0.3)
+  return countTokens(text)
 }
 
 // 解析 AWS Event Stream 二进制格式
@@ -1210,8 +1374,10 @@ async function parseEventStream(
   onChunk: (text: string, toolUse?: KiroToolUse, isThinking?: boolean, reasoningSignature?: string, redactedContent?: string) => void,
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
-  inputChars: number = 0,  // 输入字符长度，用于估算 input tokens
-  signal?: AbortSignal
+  inputChars: number = 0,  // 输入字符长度（兜底估算用）
+  signal?: AbortSignal,
+  modelId?: string,        // 模型 ID，用于 contextUsagePercentage 反推 inputTokens
+  payloadStr?: string      // 请求 payload JSON 字符串，用于 tiktoken 精确计算
 ): Promise<void> {
   const reader = body.getReader()
   const abort = () => {
@@ -1229,15 +1395,22 @@ async function parseEventStream(
   
   // 累积输出文本长度，用于估算 tokens
   let totalOutputChars = 0
+  // 累积输出文本内容，用于 tiktoken 精确计算 output tokens
+  let collectedOutputText = ''
+  // 是否已拿到 Kiro 真实 tokenUsage（最高优先级，锁定后不再被 contextUsage/tiktoken 覆盖）
+  let hasRealTokenUsage = false
   
   // 流式事件聚合计数（logStreamEvents 开启时，结束后输出摘要而非逐条输出）
   const streamEventCounts: Record<string, number> = {}
   
-  // 估算 input tokens（基于输入字符长度，仅 Kiro 后端不返回 tokenUsage 时使用）
-  // 英文约 1 字符 = 0.3 token，中文约 1 字符 = 0.6 token
-  // payload 是 JSON 以英文为主，使用 0.3 系数
-  if (inputChars > 0) {
-    usage.inputTokens = Math.max(1, Math.round(inputChars * 0.3))
+  // 初始化 input tokens 估算（优先级链路：tokenUsage > contextUsage 反推 > tiktoken > 字符系数）
+  // 这里只是兜底初值，后续真实事件会覆盖
+  if (payloadStr) {
+    // 用 tiktoken cl100k_base 精确计算（±5%）
+    usage.inputTokens = countTokens(payloadStr)
+  } else if (inputChars > 0) {
+    // 字符系数兜底（针对 payload JSON 经验值 0.42）
+    usage.inputTokens = Math.max(1, Math.round(inputChars * 0.42))
   }
   
   // Tool use 状态跟踪 - 用于累积输入片段
@@ -1302,8 +1475,23 @@ async function parseEventStream(
               const content = assistantResp.content
               if (content) {
                 onChunk(content)
-                // 累积输出字符长度
+                // 累积输出字符长度（兜底估算用）
                 totalOutputChars += content.length
+                // 累积输出文本（tiktoken 精确计算用）
+                collectedOutputText += content
+              }
+            }
+
+            // AmazonQ CLI 协议特有：CodeEvent (代码片段流式输出)
+            // 来自 amzn_qdeveloper_streaming_client 的 ChatResponseStream::CodeEvent { content: String }
+            // CodeWhisperer/AmazonQ 端点用 AssistantResponseEvent 包代码，CLI 端点单独用 CodeEvent
+            if (eventType === 'codeEvent' || event.codeEvent) {
+              const codeResp = event.codeEvent || event
+              const content = codeResp.content
+              if (content) {
+                onChunk(content)
+                totalOutputChars += content.length
+                collectedOutputText += content
               }
             }
             
@@ -1421,12 +1609,16 @@ async function parseEventStream(
                 const cacheWrite = tokenUsage.cacheWriteInputTokens || 0
                 const calculatedInput = uncached + cacheRead + cacheWrite
                 
-                if (calculatedInput > 0) usage.inputTokens = calculatedInput
+                if (calculatedInput > 0) {
+                  usage.inputTokens = calculatedInput
+                  hasRealTokenUsage = true  // 真实值，锁定不再被 contextUsage/tiktoken 覆盖
+                }
                 if (tokenUsage.outputTokens) usage.outputTokens = tokenUsage.outputTokens
                 if (tokenUsage.totalTokens) {
                   // 如果有 totalTokens，用它来推算
                   if (usage.inputTokens === 0 && usage.outputTokens > 0) {
                     usage.inputTokens = tokenUsage.totalTokens - usage.outputTokens
+                    hasRealTokenUsage = true
                   }
                 }
                 
@@ -1452,7 +1644,10 @@ async function parseEventStream(
               }
               
               // 直接在 metadata 中的 tokens
-              if (metadata.inputTokens) usage.inputTokens = metadata.inputTokens
+              if (metadata.inputTokens) {
+                usage.inputTokens = metadata.inputTokens
+                hasRealTokenUsage = true
+              }
               if (metadata.outputTokens) usage.outputTokens = metadata.outputTokens
             }
             
@@ -1464,7 +1659,10 @@ async function parseEventStream(
             // 处理 usageEvent
             if (eventType === 'usageEvent' || eventType === 'usage' || event.usageEvent || event.usage) {
               const usageData = event.usageEvent || event.usage || event
-              if (usageData.inputTokens) usage.inputTokens = usageData.inputTokens
+              if (usageData.inputTokens) {
+                usage.inputTokens = usageData.inputTokens
+                hasRealTokenUsage = true
+              }
               if (usageData.outputTokens) usage.outputTokens = usageData.outputTokens
             }
             
@@ -1496,12 +1694,25 @@ async function parseEventStream(
               proxyLogger.debug('Kiro', 'supplementaryWebLinksEvent', JSON.stringify(webLinksEvent).slice(0, 300))
             }
             
-            // 处理 contextUsageEvent - 上下文使用百分比
+            // 处理 contextUsageEvent - 上下文使用百分比（反推真实 inputTokens）
             if (eventType === 'contextUsageEvent' || event.contextUsageEvent) {
               const contextEvent = event.contextUsageEvent || event
               if (contextEvent.contextUsagePercentage !== undefined) {
                 const percentage = contextEvent.contextUsagePercentage
-                proxyLogger.info('Kiro', 'contextUsageEvent - Context usage: ' + percentage.toFixed(2) + '%')
+                // 若已拿到真实 tokenUsage，仅记录百分比，不覆盖 inputTokens
+                if (hasRealTokenUsage) {
+                  proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}% (real tokenUsage already received)`)
+                } else {
+                  // 反推真实 inputTokens：modelContext × percentage / 100
+                  const contextLen = getModelContextLength(modelId)
+                  const reverseInput = Math.round(contextLen * percentage / 100)
+                  if (reverseInput > 0) {
+                    usage.inputTokens = reverseInput
+                    proxyLogger.info('Kiro', `contextUsageEvent ${percentage.toFixed(2)}% → inputTokens=${reverseInput} (modelContext=${contextLen}, model=${modelId || 'unknown'})`)
+                  } else {
+                    proxyLogger.info('Kiro', `contextUsageEvent - Context usage: ${percentage.toFixed(2)}%`)
+                  }
+                }
                 // 如果上下文使用率超过 80%，发送警告
                 if (percentage > 80) {
                   console.warn('[Kiro] Warning: Context usage is high:', percentage.toFixed(2) + '%')
@@ -1644,11 +1855,17 @@ async function parseEventStream(
       totalOutputChars += currentToolUse.name.length + currentToolUse.inputBuffer.length
     }
     
-    // 如果 API 没有返回 token 信息，基于输出字符长度估算
-    // 输出是自然语言，中英混合平均约 0.4 token/字符
+    // 如果 API 没有返回 token 信息，优先用 tiktoken 精确计算，兜底字符系数
     if (usage.outputTokens === 0 && totalOutputChars > 0) {
-      usage.outputTokens = Math.max(1, Math.round(totalOutputChars * 0.4))
-      proxyLogger.info('Kiro', `Estimated output tokens: ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
+      if (collectedOutputText) {
+        // tiktoken cl100k_base 精确计算（±5%）
+        usage.outputTokens = Math.max(1, countTokens(collectedOutputText))
+        proxyLogger.info('Kiro', `Estimated output tokens (tiktoken): ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
+      } else {
+        // 字符系数兜底（自然语言中英混合约 0.4 token/字符）
+        usage.outputTokens = Math.max(1, Math.round(totalOutputChars * 0.4))
+        proxyLogger.info('Kiro', `Estimated output tokens (fallback): ${totalOutputChars} chars -> ${usage.outputTokens} tokens`)
+      }
     }
     
     // 流式事件聚合摘要
@@ -1769,12 +1986,13 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   try {
     do {
       const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      params.set('profileArn', resolveProfileArn(account))
+      const arnForModels = resolveProfileArn(account)
+      if (arnForModels) params.set('profileArn', arnForModels)
       if (nextToken) params.set('nextToken', nextToken)
 
       const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
       throwIfAborted(signal)
-      const response = await fetchWithProxy(url, { method: 'GET', headers, signal })
+      const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
       throwIfAborted(signal)
       
       if (!response.ok) {
@@ -1846,14 +2064,15 @@ export async function fetchAvailableSubscriptions(account: ProxyAccount): Promis
   }
 
   const profileArn = resolveProfileArn(account)
-  const body = JSON.stringify({ profileArn })
+  const body = JSON.stringify(profileArn ? { profileArn } : {})
 
   console.log(`[KiroAPI] ListAvailableSubscriptions [${account.email || account.id.slice(0, 8)}]`, {
-    url
+    url,
+    hasProfileArn: profileArn !== undefined
   })
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
     const responseText = await response.text()
     console.log(`[KiroAPI] ListAvailableSubscriptions → ${response.status}`, JSON.parse(responseText))
     
@@ -1896,18 +2115,20 @@ export async function fetchSubscriptionToken(
 
   const profileArn = resolveProfileArn(account)
 
-  // clientToken 是必需参数，需要生成 UUID
+  // clientToken 是必需参数；profileArn 仅在解析出有效值时附带
   const payload: Record<string, string> = {
     clientToken: uuidv4(),
-    profileArn,
     provider: 'STRIPE'
+  }
+  if (profileArn) {
+    payload.profileArn = profileArn
   }
   if (subscriptionType) {
     payload.subscriptionType = subscriptionType
   }
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload) })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body: JSON.stringify(payload) }, account)
     
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
@@ -1942,13 +2163,16 @@ export async function setUserPreference(
   }
 
   const profileArn = resolveProfileArn(account)
-  const body = JSON.stringify({
-    overageConfiguration: { overageStatus },
-    profileArn
-  })
+  const bodyPayload: Record<string, unknown> = {
+    overageConfiguration: { overageStatus }
+  }
+  if (profileArn) {
+    bodyPayload.profileArn = profileArn
+  }
+  const body = JSON.stringify(bodyPayload)
 
   try {
-    const response = await fetchWithProxy(url, { method: 'POST', headers, body })
+    const response = await fetchWithProxy(url, { method: 'POST', headers, body }, account)
     if (!response.ok) {
       const errorText = await response.text().catch(() => '')
       return { success: false, error: `HTTP ${response.status}: ${errorText.substring(0, 200)}` }

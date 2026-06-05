@@ -293,7 +293,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   const getLevelColor = (level: string) => {
     switch (level) {
       case 'ERROR': return 'bg-destructive/20 text-destructive border-destructive/30'
-      case 'WARN': return 'bg-yellow-500/20 text-yellow-500 border-yellow-500/30'
+      case 'WARN': return 'bg-warning/20 text-warning border-warning/30'
       case 'INFO': return 'bg-primary/20 text-primary border-primary/30'
       case 'DEBUG': return 'bg-muted text-muted-foreground border-muted'
       default: return 'bg-muted text-muted-foreground border-muted'
@@ -303,7 +303,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   const getLevelRowBg = (level: string) => {
     switch (level) {
       case 'ERROR': return 'bg-destructive/5 hover:bg-destructive/10'
-      case 'WARN': return 'bg-yellow-500/5 hover:bg-yellow-500/10'
+      case 'WARN': return 'bg-warning/5 hover:bg-warning/10'
       case 'INFO': return 'hover:bg-primary/5'
       case 'DEBUG': return 'hover:bg-muted/50'
       default: return 'hover:bg-muted/50'
@@ -331,13 +331,13 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
   if (!open) return null
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm" onClick={() => onOpenChange(false)}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => onOpenChange(false)}>
       <div 
-        className="bg-card border border-border rounded-xl shadow-2xl max-w-[90vw] w-[1200px] h-[80vh] flex flex-col overflow-hidden"
+        className="glass-card-strong rounded-2xl shadow-2xl max-w-[90vw] w-[1200px] h-[80vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 标题栏 */}
-        <div className="flex-shrink-0 flex items-center justify-between px-5 py-4 border-b border-border bg-muted/30">
+        <div className="flex-shrink-0 flex items-center justify-between px-5 py-4 border-b border-border">
           <div className="flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
               <svg className="w-5 h-5 text-primary" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -382,14 +382,14 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
             <Badge variant="secondary" className="font-mono">
               {filteredLogs.length} / {logs.length} {isEn ? 'entries' : '条'}
             </Badge>
-            <Button variant="ghost" size="icon" className="rounded-full hover:bg-destructive/10 hover:text-destructive" onClick={() => onOpenChange(false)}>
+            <Button variant="ghost" size="icon" className="rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
               <X className="w-4 h-4" />
             </Button>
           </div>
         </div>
 
         {/* 工具栏 */}
-        <div className="flex-shrink-0 flex items-center gap-2 px-4 py-2.5 border-b border-border bg-muted/20">
+        <div className="flex-shrink-0 flex items-center gap-2 px-4 py-2.5 border-b border-border">
           {/* 搜索 */}
           <div className="relative flex-1 min-w-[100px]">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
@@ -416,10 +416,10 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
             value={levelFilter}
             onChange={setLevelFilter}
             options={[
-              { value: 'all', label: isEn ? 'All' : '全部', icon: <span className="w-2.5 h-2.5 rounded-full bg-gradient-to-r from-red-500 via-yellow-500 to-blue-500" /> },
-              { value: 'ERROR', label: 'ERR', icon: <span className="w-2.5 h-2.5 rounded-full bg-red-500" /> },
-              { value: 'WARN', label: 'WARN', icon: <span className="w-2.5 h-2.5 rounded-full bg-yellow-500" /> },
-              { value: 'INFO', label: 'INFO', icon: <span className="w-2.5 h-2.5 rounded-full bg-blue-500" /> },
+              { value: 'all', label: isEn ? 'All' : '全部', icon: <span className="w-2.5 h-2.5 rounded-full bg-gradient-to-r from-destructive via-warning to-primary" /> },
+              { value: 'ERROR', label: 'ERR', icon: <span className="w-2.5 h-2.5 rounded-full bg-destructive" /> },
+              { value: 'WARN', label: 'WARN', icon: <span className="w-2.5 h-2.5 rounded-full bg-warning" /> },
+              { value: 'INFO', label: 'INFO', icon: <span className="w-2.5 h-2.5 rounded-full bg-primary" /> },
               { value: 'DEBUG', label: 'DBG', icon: <span className="w-2.5 h-2.5 rounded-full bg-gray-400" /> },
             ]}
           />
@@ -566,7 +566,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
         <div className="flex-shrink-0 flex items-center justify-between px-4 py-1.5 border-t border-border text-[10px] text-muted-foreground">
           <span>{isEn ? 'Showing' : '显示'} {filteredLogs.length.toLocaleString()} / {logs.length.toLocaleString()}</span>
           <div className="flex items-center gap-1">
-            <ArrowDown className={`h-3 w-3 ${isAtBottom ? 'text-green-500' : 'text-muted-foreground/40'}`} />
+            <ArrowDown className={`h-3 w-3 ${isAtBottom ? 'text-success' : 'text-muted-foreground/40'}`} />
             <span>{isAtBottom ? (isEn ? 'Following' : '跟随中') : (isEn ? 'Scrolled up' : '已暂停跟随')}</span>
           </div>
         </div>
@@ -574,3 +574,5 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     </div>
   )
 }
+
+

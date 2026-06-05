@@ -1,6 +1,6 @@
 import { memo, useState, useMemo } from 'react'
 import { createPortal } from 'react-dom'
-import { Card, CardContent, Badge, Button, Progress } from '../ui'
+import { Card, CardContent, Badge, Button } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountTag, AccountGroup } from '@/types/account'
@@ -23,7 +23,8 @@ import {
   ExternalLink,
   CreditCard,
   Sparkles,
-  LogOut
+  LogOut,
+  RotateCcw
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
@@ -63,7 +64,7 @@ function generateGlowStyle(tagColors: string[]): React.CSSProperties {
   }).join(', ')
   
   return {
-    background: `linear-gradient(white, white) padding-box, linear-gradient(135deg, ${gradientColors}) border-box`,
+    background: `linear-gradient(var(--card-solid), var(--card-solid)) padding-box, linear-gradient(135deg, ${gradientColors}) border-box`,
     border: '1.5px solid transparent',
     boxShadow: '0 4px 12px -2px rgba(0, 0, 0, 0.05)'
   }
@@ -158,8 +159,43 @@ export const AccountCard = memo(function AccountCard({
     toggleSelection,
     maskEmail,
     maskNickname,
-    usagePrecision
+    usagePrecision,
+    updateAccountStatus,
+    accountProxyBindings,
+    proxyPool,
+    unbindAccountFromProxy
   } = useAccountsStore()
+
+  // 该账号绑定的代理（如有）
+  const boundProxy = useMemo(() => {
+    const proxyId = accountProxyBindings[account.id]
+    if (!proxyId) return null
+    return proxyPool.get(proxyId) || null
+  }, [accountProxyBindings, account.id, proxyPool])
+
+  // 解除封禁标记中（loading 状态）
+  const [isClearingSuspended, setIsClearingSuspended] = useState(false)
+
+  // 手动解除封禁标记：调用后端 IPC → 清反代池 suspended + 清前端 lastError
+  const handleClearSuspended = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (isClearingSuspended) return
+    setIsClearingSuspended(true)
+    try {
+      const result = await window.api.proxyClearAccountSuspended(account.id)
+      if (result.success) {
+        // 前端 store 同步：status → active, lastError → undefined
+        updateAccountStatus(account.id, 'active', undefined)
+        setShowBanDialog(false)
+      } else {
+        console.error('[AccountCard] Clear suspended failed:', result.error)
+      }
+    } catch (err) {
+      console.error('[AccountCard] Clear suspended error:', err)
+    } finally {
+      setIsClearingSuspended(false)
+    }
+  }
 
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
@@ -204,7 +240,8 @@ export const AccountCard = memo(function AccountCard({
       startUrl: credentials.startUrl,
       authMethod: credentials.authMethod,
       provider: credentials.provider,
-      profileArn: account.profileArn
+      profileArn: account.profileArn,
+      accountId: account.id
     }
 
     let success = true
@@ -213,7 +250,30 @@ export const AccountCard = memo(function AccountCard({
     // 根据 switchTarget 设置决定切换目标
     if (switchTarget === 'ide' || switchTarget === 'both') {
       const result = await window.api.switchAccount(idePayload)
-      if (!result.success) { success = false; errorMsg = result.error || '' }
+      if (!result.success) {
+        success = false
+        errorMsg = result.error || ''
+      } else if (result.refreshedCredentials) {
+        // 同步 main 进程 refresh 后的最新 credentials 到 store，避免反代 store 留下已作废的 refreshToken
+        const rc = result.refreshedCredentials
+        useAccountsStore.setState((state) => {
+          const accounts = new Map(state.accounts)
+          const acc = accounts.get(account.id)
+          if (acc) {
+            accounts.set(account.id, {
+              ...acc,
+              credentials: {
+                ...acc.credentials,
+                accessToken: rc.accessToken,
+                refreshToken: rc.refreshToken,
+                expiresAt: Date.now() + rc.expiresIn * 1000
+              }
+            })
+          }
+          return { accounts }
+        })
+        useAccountsStore.getState().saveToStorage()
+      }
     }
     if (switchTarget === 'cli' || switchTarget === 'both') {
       const result = await window.api.switchAccountCli(cliPayload)
@@ -294,13 +354,18 @@ export const AccountCard = memo(function AccountCard({
   const isExpiringSoon = account.subscription.daysRemaining !== undefined &&
                          account.subscription.daysRemaining <= 7
 
-  const isHighUsage = account.usage.percentUsed > 80
+  // percentUsed 是 0~1 的小数（如 0.85 = 85%），超 1 表示 >100%
+  const isHighUsage = account.usage.percentUsed > 0.8
+  const isCritical = account.usage.percentUsed > 1
 
   // 检测账号是否被封禁/暂停（多种错误格式）
   const lowerError = account.lastError?.toLowerCase()
   const isUnauthorized = !!lowerError && (
     lowerError.includes('accountsuspendedexception') ||
     lowerError.includes('account suspended') ||
+    lowerError.includes('temporarily_suspended') ||
+    lowerError.includes('temporarily suspended') ||
+    (lowerError.includes('user id is') && lowerError.includes('suspended')) ||
     lowerError.includes('账户已封禁') ||
     lowerError.includes('已封禁') ||
     /\b423\b/.test(lowerError)
@@ -449,20 +514,25 @@ export const AccountCard = memo(function AccountCard({
   return (
     <Card
       className={cn(
-        'relative transition-all duration-300 hover:shadow-lg cursor-pointer h-full flex flex-col overflow-hidden border',
-        // 边框颜色优先级：当前使用的流光边框优先于封禁边框
-        account.isActive ? 'border-transparent active-glow-border' :
-        isUnauthorized ? 'border-red-400/50' :
-        '',
-        
-        isSelected && !account.isActive && !isUnauthorized && 'bg-primary/5',
-        
-        // 有光环时隐藏默认边框（当前使用和封禁除外）
+        'relative cursor-pointer h-full flex flex-col overflow-hidden bg-solid-card',
+        // 默认 hover 浮起 + 阴影增强（除 active/封禁状态外，状态自带样式）
+        !account.isActive && !isUnauthorized && 'hover-lift',
+        // 当前使用：流光边框，去掉默认边框
+        account.isActive && 'border-transparent active-glow-border',
+        // 封禁：红色边框
+        isUnauthorized && 'border-destructive/50',
+        // 有标签光环：透明边框给光环让位
         accountTags.length > 0 && !account.isActive && !isUnauthorized && 'border-transparent'
       )}
       style={finalStyle}
       onClick={() => toggleSelection(account.id)}
     >
+      {/* 选中态独立覆盖层 — 避免被标签光环的 inline style (box-shadow/background) 覆盖
+          z-10 在卡片内容上方，pointer-events-none 让交互穿透到 Card */}
+      {isSelected && !account.isActive && !isUnauthorized && (
+        <div className="absolute inset-0 pointer-events-none rounded-[inherit] ring-2 ring-inset ring-primary/60 bg-primary/[0.08] z-10" />
+      )}
+
       {/* 封禁角标 - 当前使用时显示在流光边框上 */}
       {account.isActive && isUnauthorized && (
         <div className="banned-badge" title={t('accounts.card.banned')} />
@@ -491,7 +561,7 @@ export const AccountCard = memo(function AccountCard({
                  <h3 
                    className={cn(
                      "font-semibold text-sm truncate cursor-pointer transition-colors",
-                     emailCopied ? "text-green-500" : "text-foreground/90 hover:text-primary"
+                     emailCopied ? "text-success" : "text-foreground/90 hover:text-primary"
                    )}
                    title={`${getDisplayName(account)} (${isEn ? 'Click to copy' : '点击复制'})`}
                    onClick={(e) => {
@@ -507,10 +577,10 @@ export const AccountCard = memo(function AccountCard({
                  {/* Status Badge */}
                  <div className={cn(
                     "text-[10px] font-medium px-2 py-0.5 rounded-full flex items-center gap-1 flex-shrink-0",
-                    isUnauthorized ? "text-red-600 bg-red-100 dark:text-red-400 dark:bg-red-900/30" :
-                    account.status === 'active' ? "text-green-600 bg-green-100 dark:text-green-400 dark:bg-green-900/30" :
-                    account.status === 'error' ? "text-red-600 bg-red-100 dark:text-red-400 dark:bg-red-900/30" :
-                    account.status === 'expired' ? "text-orange-600 bg-orange-100 dark:text-orange-400 dark:bg-orange-900/30" :
+                    isUnauthorized ? "text-destructive bg-destructive/10" :
+                    account.status === 'active' ? "text-success bg-success/10" :
+                    account.status === 'error' ? "text-destructive bg-destructive/10" :
+                    account.status === 'expired' ? "text-warning bg-warning/10" :
                     account.status === 'refreshing' ? "text-primary bg-primary/10" :
                     "text-muted-foreground bg-muted"
                  )}>
@@ -556,8 +626,34 @@ export const AccountCard = memo(function AccountCard({
             <Badge variant="outline" className="text-[10px] h-5 px-2 text-muted-foreground font-normal border-muted-foreground/30 bg-muted/30">
                 {account.idp}
             </Badge>
+            {/* 代理绑定徽章：可点击解绑 */}
+            {boundProxy && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  'text-[10px] h-5 px-1.5 font-normal cursor-pointer transition-colors group',
+                  boundProxy.enabled && boundProxy.status !== 'dead'
+                    ? 'border-cyan-500/40 text-cyan-700 dark:text-cyan-300 bg-cyan-500/10 hover:bg-cyan-500/20'
+                    : 'border-amber-500/40 text-amber-700 dark:text-amber-300 bg-amber-500/10'
+                )}
+                title={`${isEn ? 'Bound proxy:' : '绑定代理：'} ${boundProxy.host}:${boundProxy.port}${boundProxy.label ? ` (${boundProxy.label})` : ''}\n${isEn ? 'Click to unbind' : '点击解绑'}`}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (confirm(isEn
+                    ? `Unbind ${account.email} from ${boundProxy.host}:${boundProxy.port}?`
+                    : `解绑 ${account.email} 与 ${boundProxy.host}:${boundProxy.port}？`
+                  )) {
+                    unbindAccountFromProxy(account.id)
+                  }
+                }}
+              >
+                <span className="opacity-70 group-hover:hidden">⇄</span>
+                <span className="hidden group-hover:inline">✕</span>
+                <span className="ml-0.5">{boundProxy.host.length > 15 ? boundProxy.host.slice(0, 12) + '…' : boundProxy.host}</span>
+              </Badge>
+            )}
             {account.isActive && (
-              <Badge variant="default" className="ml-auto h-5 bg-green-500 text-white border-0 hover:bg-green-600">
+              <Badge variant="default" className="ml-auto h-5 bg-success text-white border-0 hover:bg-success/90">
                 {isEn ? 'Active' : '当前使用'}
               </Badge>
             )}
@@ -567,17 +663,58 @@ export const AccountCard = memo(function AccountCard({
         <div className="bg-muted/30 p-3 rounded-lg space-y-2 border border-border/50">
             <div className="flex justify-between items-end text-xs">
                 <span className="text-muted-foreground font-medium">{isEn ? 'Usage' : '使用量'}</span>
-                <span className={cn("font-mono font-medium", isHighUsage ? "text-amber-600" : "text-foreground")}>
+                <span className={cn(
+                  "font-mono font-medium tabular-nums",
+                  isCritical ? "text-destructive" : isHighUsage ? "text-warning" : "text-foreground"
+                )}>
                    {(account.usage.percentUsed * 100).toFixed(usagePrecision ? 2 : 0)}%
+                   {isCritical && (
+                     <span className="ml-1.5 text-[10px] text-red-600 font-semibold">
+                       (+{((account.usage.percentUsed - 1) * 100).toFixed(usagePrecision ? 2 : 0)}% {isEn ? 'over' : '超'})
+                     </span>
+                   )}
                 </span>
             </div>
-            <Progress
-              value={account.usage.percentUsed * 100}
-              className="h-1.5"
-              indicatorClassName={isHighUsage ? "bg-amber-500" : "bg-primary"}
-            />
+            {/* 自定义双层进度条：超额时分段显示套餐内（amber）+ 超额（red） */}
+            {(() => {
+              const percent = account.usage.percentUsed
+              if (isCritical) {
+                // 套餐部分占总进度的比例 = 1 / percent
+                const planRatioPct = (1 / percent) * 100
+                return (
+                  <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
+                    <div
+                      className="absolute inset-y-0 left-0 bg-warning transition-all duration-300"
+                      style={{ width: `${planRatioPct}%` }}
+                    />
+                    <div
+                      className="absolute inset-y-0 right-0 bg-red-500 transition-all duration-300"
+                      style={{ left: `${planRatioPct}%` }}
+                    />
+                  </div>
+                )
+              }
+              return (
+                <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-foreground/10">
+                  <div
+                    className={cn(
+                      "absolute inset-y-0 left-0 transition-all duration-300",
+                      isHighUsage ? "bg-warning" : "bg-primary"
+                    )}
+                    style={{ width: `${Math.min(percent * 100, 100)}%` }}
+                  />
+                </div>
+              )
+            })()}
             <div className="flex justify-between text-[10px] text-muted-foreground pt-0.5">
-                <span>{formatUsage(account.usage.current)} / {formatUsage(account.usage.limit)}</span>
+                <span className="flex items-center gap-1.5">
+                  <span>{formatUsage(account.usage.current)} / {formatUsage(account.usage.limit)}</span>
+                  {isCritical && (
+                    <span className="text-red-600 font-semibold">
+                      (+{formatUsage(account.usage.current - account.usage.limit)})
+                    </span>
+                  )}
+                </span>
                 {account.usage.nextResetDate && (
                   <span className="flex items-center gap-1">
                     <Calendar className="h-3 w-3" />
@@ -597,7 +734,7 @@ export const AccountCard = memo(function AccountCard({
            {/* 基础额度 */}
            {account.usage.baseLimit !== undefined && account.usage.baseLimit > 0 && (
              <div className="flex items-center gap-2">
-               <div className="w-1.5 h-1.5 rounded-full bg-blue-500 flex-shrink-0" />
+               <div className="w-1.5 h-1.5 rounded-full bg-primary flex-shrink-0" />
                <span className="text-muted-foreground">{isEn ? 'Base:' : '基础:'}</span>
                <span className="font-medium">{formatUsage(account.usage.baseCurrent ?? 0)}/{formatUsage(account.usage.baseLimit)}</span>
                {account.usage.nextResetDate && (
@@ -613,7 +750,7 @@ export const AccountCard = memo(function AccountCard({
            {/* 试用额度 */}
            {account.usage.freeTrialLimit !== undefined && account.usage.freeTrialLimit > 0 && (
              <div className="flex items-center gap-2">
-               <div className="w-1.5 h-1.5 rounded-full bg-purple-500 flex-shrink-0" />
+               <div className="w-1.5 h-1.5 rounded-full bg-warning flex-shrink-0" />
                <span className="text-muted-foreground">{isEn ? 'Trial:' : '试用:'}</span>
                <span className="font-medium">{formatUsage(account.usage.freeTrialCurrent ?? 0)}/{formatUsage(account.usage.freeTrialLimit)}</span>
                {account.usage.freeTrialExpiry && (
@@ -629,7 +766,7 @@ export const AccountCard = memo(function AccountCard({
            {/* 奖励额度 */}
            {account.usage.bonuses?.map((bonus) => (
              <div key={bonus.code} className="flex items-center gap-2">
-               <div className="w-1.5 h-1.5 rounded-full bg-cyan-500 flex-shrink-0" />
+               <div className="w-1.5 h-1.5 rounded-full bg-success flex-shrink-0" />
                <span className="text-muted-foreground truncate max-w-[80px]" title={bonus.name}>{bonus.name}:</span>
                <span className="font-medium">{formatUsage(bonus.current)}/{formatUsage(bonus.limit)}</span>
                {bonus.expiresAt && (
@@ -670,7 +807,7 @@ export const AccountCard = memo(function AccountCard({
             <div className="text-[10px] text-muted-foreground flex flex-col leading-tight gap-0.5">
                 <div className="flex items-center gap-1">
                    <Clock className="h-3 w-3" />
-                   <span className={isExpiringSoon ? "text-amber-600 font-medium" : ""}>
+                   <span className={isExpiringSoon ? "text-warning font-medium" : ""}>
                       {account.subscription.daysRemaining !== undefined ? (isEn ? `${account.subscription.daysRemaining}d left` : `剩 ${account.subscription.daysRemaining} 天`) : '-'}
                    </span>
                 </div>
@@ -713,7 +850,7 @@ export const AccountCard = memo(function AccountCard({
                   <KeyRound className={cn("h-3.5 w-3.5", isRefreshingToken && "animate-pulse")} />
                </Button>
                
-               <Button size="icon" variant="ghost" className={cn("h-7 w-7 text-muted-foreground hover:text-foreground", copied && "text-green-500")} onClick={(e) => { e.stopPropagation(); handleCopyCredentials() }} title={isEn ? 'Copy credentials' : '复制凭证'}>
+               <Button size="icon" variant="ghost" className={cn("h-7 w-7 text-muted-foreground hover:text-foreground", copied && "text-success")} onClick={(e) => { e.stopPropagation(); handleCopyCredentials() }} title={isEn ? 'Copy credentials' : '复制凭证'}>
                   {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                </Button>
 
@@ -743,14 +880,14 @@ export const AccountCard = memo(function AccountCard({
       {/* 封禁详情弹窗 */}
       {showBanDialog && isUnauthorized && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => setShowBanDialog(false)} />
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowBanDialog(false)} />
           <div className="relative bg-background rounded-xl shadow-2xl w-full max-w-lg m-4 animate-in fade-in zoom-in-95 duration-200 border overflow-hidden">
             <div className="p-4 border-b flex items-center justify-between bg-red-50 dark:bg-red-900/20">
               <div className="flex items-center gap-2 text-red-600 dark:text-red-400">
                 <AlertCircle className="h-5 w-5" />
                 <span className="font-bold">{isEn ? 'Account Suspended' : '账户已封禁'}</span>
               </div>
-              <Button variant="ghost" size="icon" className="h-8 w-8 hover:bg-red-100 dark:hover:bg-red-900/30" onClick={() => setShowBanDialog(false)}>
+              <Button variant="ghost" size="icon" className="h-8 w-8 rounded-lg hover:bg-red-500 hover:text-white transition-colors" onClick={() => setShowBanDialog(false)}>
                 <X className="h-4 w-4" />
               </Button>
             </div>
@@ -765,7 +902,7 @@ export const AccountCard = memo(function AccountCard({
                   {account.lastError}
                 </div>
               </div>
-              <div className="flex items-center justify-between pt-2">
+              <div className="flex items-center justify-between pt-2 gap-2 flex-wrap">
                 <a 
                   href="https://support.aws.amazon.com/#/contacts/kiro" 
                   target="_blank" 
@@ -776,9 +913,25 @@ export const AccountCard = memo(function AccountCard({
                   <ExternalLink className="h-3 w-3" />
                   {isEn ? 'Contact Support' : '联系支持'}
                 </a>
-                <Button size="sm" variant="outline" onClick={() => setShowBanDialog(false)}>
-                  {isEn ? 'Close' : '关闭'}
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleClearSuspended}
+                    disabled={isClearingSuspended}
+                    title={isEn ? 'Mark as recovered — proxy pool will use this account again' : '标记为已恢复 — 反代池会重新使用该账号'}
+                  >
+                    {isClearingSuspended ? (
+                      <RefreshCw className="h-3 w-3 mr-1 animate-spin" />
+                    ) : (
+                      <RotateCcw className="h-3 w-3 mr-1" />
+                    )}
+                    {isEn ? 'Reset Suspended' : '重置封禁状态'}
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => setShowBanDialog(false)}>
+                    {isEn ? 'Close' : '关闭'}
+                  </Button>
+                </div>
               </div>
             </div>
           </div>
@@ -789,20 +942,20 @@ export const AccountCard = memo(function AccountCard({
       {/* 订阅管理弹窗 */}
       {showSubscriptionDialog && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => { setShowSubscriptionDialog(false); setIsFirstTimeUser(false); setSubscriptionError(null); setSubscriptionSuccess(null) }} />
+          <div className="absolute inset-0 bg-black/50" onClick={() => { setShowSubscriptionDialog(false); setIsFirstTimeUser(false); setSubscriptionError(null); setSubscriptionSuccess(null) }} />
           <div className="relative bg-background rounded-xl shadow-2xl w-full max-w-2xl m-4 animate-in fade-in zoom-in-95 duration-200 border overflow-hidden">
-            <div className="p-4 border-b flex items-center justify-between bg-gradient-to-r from-primary/10 to-purple-500/10">
+            <div className="p-4 border-b flex items-center justify-between bg-gradient-to-r from-primary/10 to-[var(--gradient-to)]/10">
               <div className="flex items-center gap-2 text-primary">
                 <CreditCard className="h-5 w-5" />
                 <span className="font-bold">{isEn ? (isFirstTimeUser ? 'Choose Your Plan' : 'Subscription Plans') : (isFirstTimeUser ? '选择订阅计划' : '订阅计划')}</span>
               </div>
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => { setShowSubscriptionDialog(false); setIsFirstTimeUser(false); setSubscriptionError(null); setSubscriptionSuccess(null) }}>
+              <Button variant="ghost" size="icon" className="h-8 w-8 rounded-lg hover:bg-red-500 hover:text-white transition-colors" onClick={() => { setShowSubscriptionDialog(false); setIsFirstTimeUser(false); setSubscriptionError(null); setSubscriptionSuccess(null) }}>
                 <X className="h-4 w-4" />
               </Button>
             </div>
             <div className="p-4 space-y-4">
               {isFirstTimeUser ? (
-                <div className="text-xs text-muted-foreground mb-2 bg-amber-500/10 text-amber-600 dark:text-amber-400 p-2 rounded-lg">
+                <div className="text-xs text-muted-foreground mb-2 bg-warning/10 text-warning p-2 rounded-lg">
                   {isEn ? 'Please select a subscription plan to continue.' : '请选择一个订阅计划以继续使用。'}
                 </div>
               ) : (
@@ -820,7 +973,7 @@ export const AccountCard = memo(function AccountCard({
               )}
               
               {subscriptionSuccess && (
-                <div className="text-xs bg-green-500/10 text-green-600 dark:text-green-400 p-2 rounded-lg flex items-center gap-2">
+                <div className="text-xs bg-success/10 text-success p-2 rounded-lg flex items-center gap-2">
                   <Check className="h-4 w-4 shrink-0" />
                   <span>{subscriptionSuccess}</span>
                 </div>
@@ -906,3 +1059,5 @@ export const AccountCard = memo(function AccountCard({
     </Card>
   )
 })
+
+

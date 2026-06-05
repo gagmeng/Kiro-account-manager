@@ -272,6 +272,480 @@ npx electron-builder --linux --arm64
 ## 📋 更新日志
 
 
+### v1.7.4 (2026-6-5) — profileArn 精细化策略 + CI 修复 + 日志脱敏修正 + 注册流程防悬挂
+
+#### 🛡️ profileArn 策略精细化
+
+- **修复**: 恢复 `resolveProfileArnForWrite` 为 BuilderId 返回占位符 ARN — Kiro IDE 内部逻辑依赖 `profileArn` 字段存在，移除后导致 IDE 功能异常
+- **修复**: 非流式 API 端点（`ListAvailableModels`、`ListAvailableSubscriptions`、`CreateSubscriptionToken`、`setUserPreference`）恢复发送占位符 ARN（AWS 400 "profileArn must not be null"）
+- **修复**: 流式端点（`generateAssistantResponse` / `SendMessageStreaming`）仍不发送占位符 ARN（会 403）
+- **修复**: 停用 `migrateAccountDataIfNeeded` 对占位符 ARN 的清理逻辑
+
+#### 🔧 GitHub Actions CI 修复
+
+- **修复**: `softprops/action-gh-release@v1` 上传重复文件名 asset 导致 404 — 改用 `find + cp` 扁平化去重到 `release-assets/` 目录后再上传
+- **新增**: 添加 `yaml-language-server` schema 声明消除 IDE YAML lint 误报
+
+#### 📝 日志脱敏修正
+
+- **修复**: `inputTokens`、`outputTokens`、`cacheReadTokens`、`reasoningTokens` 等计量字段被误判为敏感信息打 `***` — 移除泛化的 `'token'` 匹配规则，添加 `SAFE_KEYS` 白名单
+
+#### 🐛 注册流程修复
+
+- **修复**: `Registrar.destroy()` 未调用 `abort()` 导致已销毁的注册器继续异步执行后续步骤（如发送 OTP），用户提交验证码时报"无进行中的注册流程"
+- **修复**: Outlook IMAP `readLine()` 无超时保护 — 服务器中途卡住（网络抖动/限流/半关闭连接）时 Promise 永远挂起，导致收信环节卡死。现加 30s 超时，超时后自动关闭连接并重试
+
+#### 💎 反代页面 UX
+
+- **修复**: "首选端点"下拉框被"安全与可观测设置"卡片遮挡（z-index 层叠上下文修复）
+- **优化**: 进入反代页面不再自动触发全量账号同步，仅在账号真正增删时才同步
+
+---
+
+### v1.7.3 (2026-6-4) — Kiro IDE Token 双向同步 + BuilderId 占位符 ARN 闭环修复 + 主动续期 + macOS 自动更新修复
+
+> 本版本聚焦解决"通过本工具切号 / 刷新 Token 后，Kiro IDE 桌面端约 1 小时后被强制登出"的核心故障，闭环修掉 BuilderId 账号在多处仍被写入占位符 profileArn 的连环 bug，新增可选的 IDE Token 主动续期能力（默认关闭），修复 macOS 自动更新 404，附带 Kiro IDE 二进制补丁器脚本与若干 UI 细节调整。
+
+#### 🔥 核心修复：Kiro IDE Token 双向同步（修复"切号 ~1h 后 IDE 强制登出"）
+
+- **修复**: 🔥 **`switch-account` 写入磁盘的 refreshToken 是已被服务端 rotate 作废的旧值** — 旧实现在调 OIDC 拿到 `access_v2 + refresh_v2` 后只更新本地变量 `accessToken`，写入 `~/.aws/sso/cache/kiro-auth-token.json` 时 `refreshToken` 仍是 `v1`（已被 BuilderId 的 rotating refresh token 机制立即作废）。Kiro IDE 在 ~50 分钟后 refresh loop 用 `v1` 调 OIDC → 401 → `logoutAndForget()` 强制登出
+- **修复**: 🔥 **`refresh-account-token`（"刷新 Token"按钮）从来不写磁盘文件** — 旧实现只更新工具内 store 并通知 renderer，磁盘 token 文件没动；Kiro IDE 永远看不到新 token，UI 显示"已刷新"但 IDE 实际仍用旧的，约 1 小时后撞同样的 401 → 登出
+- **修复**: 🔥 **`background-batch-refresh`（自动刷新走的批量 IPC）也不写磁盘** — "自动刷新"功能（默认 5 分钟一次）刷新所有账号但永远不同步到 IDE 磁盘，是修复"切号"和"刷新 Token"按钮后的最大隐藏漏洞。现在每个账号刷新成功后，若识别为 IDE 当前激活账号则自动同步
+- **修复**: `switch-account` 的 `expiresAt` 硬编码 `Date.now() + 3600*1000`，现改用 OIDC 返回的真实 `expiresIn`
+- **修复**: `switch-account` 在 OIDC 刷新失败时仍用旧 token 写文件埋雷，现直接报错不写文件，并提示用户
+
+#### 🔁 新模块：`src/main/kiroAuthSync.ts` 与双向同步
+
+- **新增**: `writeKiroAuthTokenFile` / `readKiroAuthTokenFile` 共用 helper，统一以 Kiro IDE 完全兼容的格式（`mode 0o600` 等）读写 `~/.aws/sso/cache/kiro-auth-token.json`；社交 / IdC 字段顺序对齐 IDE 源码序列化结果
+- **新增**: `parseAccessTokenClaims` — 解 access token 的 JWT 第二段拿 `sub / email / aud`，用于反向同步时识别"IDE 这次自刷的是哪个账号"
+- **新增**: `watchKiroAuthTokenFile` — 用 `fs.watchFile` 监听磁盘 token 变化 + 内容防抖；账号管理器主进程启动时自动挂上
+- **新增**: **反向同步链路** — Kiro IDE 自己 refresh 后写新 token 到磁盘 → 反代 watcher 检测到 → JWT sub 三层匹配（sub / lastSwitchedAccountId / refreshToken）找到反代 store 里的账号 → 更新 credentials → `webContents.send('kiro-ide-token-changed')` 通知 renderer 重新 loadAccounts，UI 立刻看到最新 expiresAt
+- **新增**: 防回环 — 反代自己刚写入的 token 签名 `lastWrittenTokenSignature` 会被 watcher 识别并跳过，避免 IDE / 反代来回打架
+- **新增**: `switchAccount` IPC 返回 `refreshedCredentials`（含 refresh 后真实的 access/refresh/expiresIn），renderer 立即同步到 store；解决"反代 store 仍存 v1 → 下次刷新撞已作废 refresh"的连锁问题
+
+#### 🛡️ BuilderId 占位符 profileArn 闭环修复
+
+- **修复**: 🔥 **Kiro IDE 桌面端 `FixedProfileArns` 给 BuilderId 硬编码占位符 ARN `profile/AAAACCCCXXXX`** — 反代直接调 `codewhisperer.us-east-1.amazonaws.com/ListAvailableModels` 携带此 ARN 必触发 403 "User is not authorized to make this call."。本工具反代侧 `kiroApi.ts` 的 `resolveProfileArn` 改为：BuilderId 与未知 provider 不附加任何 profileArn；所有调用点（`fetchKiroModels` / `callKiroApiStream` / 订阅三接口）全部加判空守护
+- **修复**: 🔥 **`switch-account` / `switch-account-cli` / `refresh-account-token`（同步分支）/ `runProactiveRenewal` 等 4 处写入路径仍内联占位符 ARN** — BuilderId 账号会被强行塞这个占位符到 `~/.aws/sso/cache/kiro-auth-token.json` 或 `~/.local/share/kiro-cli/data.sqlite3`，导致 Kiro IDE / kiro-cli 后续走 REST 端点的调用同样被埋雷。现统一改用 `resolveProfileArnForWrite` helper：BuilderId 永远返回 `undefined`
+- **新增**: `kiroAuthSync.ts` 集中维护 `KIRO_BUILDER_ID_PLACEHOLDER_ARN` / `KIRO_SOCIAL_PROFILE_ARN` 常量；反代 `kiroApi.ts` 改为 re-export，消除 5 处常量重复定义的漂移风险
+- **新增**: `writeKiroAuthTokenFile` 内部加防线 — 检测到调用方传入占位符 ARN 自动 strip 为 `undefined`，任何漏掉 helper 的路径仍被兜底
+- **新增**: 启动时 `migrateAccountDataIfNeeded` 一次性扫描 electron-store 里的账号数据，把已被旧版本 / Kiro IDE 写入的占位符 ARN 清空并幂等回写
+
+#### 🆕 新增：IDE Token 主动续期（Proactive Renewal，默认关闭）
+
+- **新增**: Settings → Auto Refresh 块下方新增 **「IDE 主动续期」** 开关 — 启用后账号管理器主进程会在 IDE 当前激活账号的 token 剩 ~15 分钟时抢先 refresh + 写磁盘，Kiro IDE 始终看到剩余 ≥ 45 分钟的 token，IDE 内部 `attemptRefreshIfCloseToExpiry` 永远不触发，彻底消除 IDE 与本工具同时 refresh 撞车 OIDC rotation 的 race 风险
+- **新增**: 仅对"当前 IDE 激活账号"维护一个 timer（开销最低）；`switch-account` / `refresh-account-token` / `logout-account` 都会正确调度或清理 timer，绝不泄漏
+- **新增**: 续期失败时 timer 停止 + 由 IDE 自己的 refresh loop 接管 — 与双向同步机制天然互补
+- **新增**: 持久化在 electron-store（`proactiveRenewalEnabled` 键），重启账号管理器后自动恢复
+
+#### 🧰 Kiro IDE 二进制补丁器 `scripts/patch-kiro-ide.cjs`
+
+- **新增**: 跨平台脚本 — 针对 Kiro IDE 桌面端 `extension.js` 与 `packages/kiro-shared` bundled JS 做 3 处精准正则替换：
+  - `getFixedProfileArn`：BuilderId 短路返回 `void 0`
+  - `supportsProfiles`：把 BuilderId 移出 IdC 列表
+  - `resolveProfileArn`：BuilderId token 直接返回 `void 0`
+- **新增**: 同时清理 `%APPDATA%/Kiro/User/globalStorage/kiro.kiro-agent/profile.json` 里写入的占位符 ARN
+- **新增**: 幂等（首行 MARKER）+ 备份（`.kpatch-backup`）+ `--dry-run` / `--restore` / `--verbose` / `--kiro-dir` 参数；Kiro IDE 升级覆盖后重新运行同一命令即可重打
+- **使用**: `node scripts/patch-kiro-ide.cjs --dry-run` 先预检，`node scripts/patch-kiro-ide.cjs` 正式打。建议完全退出 Kiro 后再执行
+
+#### 🔧 构建 / 发布
+
+- **修复**: 🔥 **macOS 自动更新 404** — `electron-builder` 默认行为下 mac zip 文件名把 `productName` 中的空格替换成 `.`（生成 `Kiro.Account.Manager-1.7.2-mac.zip`），但 `latest-mac.yml` 里的 `url` 字段把空格替换成 `-`（指向 `Kiro-Account-Manager-1.7.2-mac.zip`），两者 mismatch → updater 下载 404。`electron-builder.yml` 新增 `mac.artifactName: ${name}-${version}-${arch}-mac.${ext}` 与显式 `target: zip/dmg × [x64, arm64]`，让所有平台命名统一为 `kiro-account-manager-…` 风格，并让 `latest-mac.yml` 同时包含 x64 + arm64 双入口，Apple Silicon 用户能拿到 arm64 原生包
+- **注意**: 现有 v1.7.2 macOS 用户因上述 bug 仍无法自动升级到 v1.7.3，请到 [Releases](https://github.com/chaogei/Kiro-account-manager/releases/latest) 手动下载对应 dmg/zip 安装一次
+
+#### 🎨 UI / 细节调整
+
+- **优化**: 注册页面 — 「日志」卡片从页面最底部移到「开始注册」按钮所在卡片之后，操作时可一眼看到实时进度
+- **优化**: 账号工具栏 — 「批量检查账户信息」与「批量刷新 Token」两个按钮之前都用 `RefreshCw` 图标，肉眼分不清；现分别改为 `Activity`（检查/活动语义）与 `KeyRound`（刷新令牌语义，与卡片视图一致），并附 i18n tooltip
+- **新增**: Settings → Auto Refresh 块下加双向同步说明 — 明确「Kiro IDE 有自己的内部刷新循环」、「切号 / 刷新仅当账号是 IDE 当前激活账号才同步到磁盘」、「IDE 自刷后本工具会反向同步到 store」
+- **新增**: `onKiroIdeTokenChanged` IPC 事件 — renderer 收到后自动 `loadFromStorage`，IDE 自刷后 UI 立刻刷新 expiresAt
+
+#### 🔍 验证
+
+- 全项目 `npm run typecheck:node && npm run typecheck:web` 两段 zero error 通过
+- ReadLints 对全部改动文件零警告
+- Kiro IDE 补丁脚本 `--dry-run` 在 Windows 实测 D:\Program\Kiro 上 5 个目标文件全部精准命中（3 + 1 + 1 + 1 + 1 处替换）
+
+
+### v1.7.2 (2026-6-2) — 批量订阅链接增强 + 卡密解析修复 + 添加/导入分组归属
+
+> 本版本聚焦批量订阅「获取链接」界面的批量导入与快选分批打开、卡密/凭证解析的边界字符修复（解决导入验证 401），以及添加 / 批量 / 导入账号时可归入指定分组。
+
+#### 🔗 批量订阅 · 获取链接
+
+- **新增**: 链接批量导入 — 弹窗粘贴多行文本，自动从每行提取 URL（支持纯 URL，或「邮箱<分隔符>URL」，分隔符兼容 空格 / 逗号 / Tab / 竖线 / ----），按 URL 去重后以「成功」状态进入列表，可与现有链接一样单个 / 多选打开、复制、导出
+- **新增**: 快选「前 N 个」 — 从列表顶部一键选中前 N 个可用链接（默认 10，数量跨页面记忆），便于分批打开
+- **新增**: 快选「下一批」 — 基于游标从上次位置继续选 N 个，到末尾循环，配合「打开选中」可分批打开、避免一次开太多浏览器窗口
+
+#### 🎫 卡密 / 凭证解析（边界字符修复）
+
+- **修复**: 🔥 **卡密导入验证 401（Bad credentials）** — RefreshToken / ClientSecret 为 base64url(JWT)，当字段值以 `-` 结尾时会与 `----` 分隔符相邻形成 5+ 个连续 `-`，旧的 `split('----')` 只吃前 4 个，导致 ClientSecret 末尾 `-` 丢失（JWT 损坏）、provider 变成 `-BuilderId` → authMethod 被误判为 social → 刷新走错端点报 401
+- **新增**: 统一解析函数 `splitCredentialLine` — 用 `/-{4,}/` 整体匹配分隔符，把多出的 (N-4) 个 `-` 归还前一字段，保证 JWT 完整、provider 正确；应用于 OIDC 批量导入、TXT 文件卡密导入、Outlook 邮箱解析
+- **修复**: TXT 文件卡密导入此前硬编码 `idp=BuilderId` 且未读第 6 字段 — 现改为读取登录方式并按 ClientId / Secret 推断，与弹窗批量导入逻辑一致
+
+#### 🗂️ 添加 / 批量 / 导入 · 分组归属
+
+- **新增**: 添加账号弹窗顶部新增「添加到分组」下拉 — 覆盖 登录 / OIDC 单个 / OIDC 批量 / SSO 全部方式；打开弹窗时默认选中「当前打开的分组」，可改选任意分组或「默认（未分组）」
+- **新增**: 文件导入（CSV / TXT / 卡密）归入「当前打开的分组」，导入完成提示显示分组名；JSON 完整备份导入保留原分组结构
+- **修复**: 原先添加账号写死 `groupId: undefined` 导致新账号永远进「未分组」，现按所选分组归类
+
+
+### v1.7.1 (2026-6-1) — Proton 注册取码稳定性 / 速度优化 + 社交登录卡密修复
+
+> 本版本聚焦 Proton 邮箱注册流程的验证码自动获取（准确率 + 速度 + 日志可见性）、Proton 登录态与代理体验，以及 GitHub/Google 社交登录账号的卡密导入导出修复。
+
+#### 🎫 卡密导入 / 导出（社交登录修复）
+
+- **修复**: 🔥 **GitHub / Google 社交登录账号卡密批量导入失败** — 旧逻辑导入时硬编码 `provider=BuilderId`(IdC)，而社交账号没有 ClientId / Secret，被验证接口 `authMethod !== 'social' && (!clientId || !clientSecret)` 直接拒绝（提示"请填写 Client ID 和 Client Secret"）
+- **新增**: 卡密导出格式新增**第 6 字段「登录方式(idp)」** — `邮箱----密码----RefreshToken----ClientId----ClientSecret----登录方式`，导入时可精确还原 social(Github/Google) / IdC(BuilderId/Enterprise)
+- **新增**: 旧 5 字段卡密兼容 — 无第 6 字段时按 ClientId / Secret 是否为空推断：都空 → social（默认 Google），有 → IdC(BuilderId)。社交账号刷新只需 RefreshToken，推断后即可验证通过
+#### 📧 Proton 验证码自动获取（注册流程）
+
+- **修复**: 取码时误点邮件行内的星标按钮 — 表现为"邮件已到却一直在点星标/取消、读不到码"。改为精确点击邮件主题文本（避开 button / checkbox）打开邮件
+- **修复**: 验证码被其它邮件干扰 — AWS 同时下发的「Response Required: Your Kiro Account」（收件人相同但无验证码）会把验证码邮件挤到第二封。现按发件人 `no-reply@signin.aws` 精确筛选，并读取前两封候选，避免误判"已打开当前邮件但无码"而卡死
+- **新增**: 收件人原样精确匹配 — 用邮件头收件人地址（保留点号）区分同一母号不同点号变体的旧验证码，杜绝取到历史码
+- **优化**: 取码速度 — 点开邮件后由固定 2.2s 死等改为轮询渲染就绪（出现 6 位码 / 收件人+正文齐备即继续，通常 ~0.5s 命中）；Proton 取码是本地 DOM 轮询、无网络限流，轮询间隔从沿用的 3s 收紧到 ≤1s。验证码到达 → 读到延迟约从 4s 降到 1.5s
+- **新增**: 取码全过程日志接入注册页面日志面板 — 发件人筛选、收件人精确匹配、"最新邮件收件人非当前地址，等待中"等状态实时可见
+
+#### 🔐 Proton 登录态 + 代理
+
+- **修复**: 切换页面后返回，Proton 登录状态显示变回"未登录" — 改用模块级缓存跨组件卸载/挂载保持登录态展示
+- **优化**: Proton 取码窗口默认走「设置页全局代理」（`process.env.HTTPS_PROXY`），而非系统代理或注册代理池；窗口复用时也刷新 session 代理，设置变更后下次取码即生效
+
+
+
+
+### v1.7.0 (2026-5-28) — 安全加固 + 全功能扩展大版本
+
+> 本版本包含 70+ 项改进，覆盖反代安全加固、批量注册并发隔离、SOCKS 代理、任务中心、Webhook 通知、报表分析、一键诊断、配置导入导出、性能优化等多个方向。
+
+#### 🛡️ 反代安全加固（21 项）
+
+**P0 紧急安全**
+- **修复**: `readBody` 加入请求体大小上限（默认 10MB），Content-Length 提前拒绝 + 流式累加超限断连，触发 HTTP 413（防 DoS）
+- **修复**: 检测到 host=`0.0.0.0`/`::` 且未配置 API Key 时拒绝启动；UI 显示红色警告，需显式 `allowExternalWithoutApiKey` 才能裸跑
+- **修复**: API Key 比较改用 `crypto.timingSafeEqual`，杜绝时序攻击逐字猜 Key
+- **修复**: 错误响应 500 类只返回通用消息 "Internal server error"；自动脱敏 Bearer/access_token/JWT/系统路径
+- **修复**: `/admin/config` GET 屏蔽 `apiKeys[].key` 明文，仅返回 `xxxx***last4`
+
+**P1 运维与可观测**
+- **新增**: IP 白名单 / 黑名单（支持单 IP + IPv4/IPv6 CIDR）
+- **新增**: 反代关键事件接入 Webhook（封号 / 全员配额耗尽，5 分钟去重）
+- **新增**: `/admin/config` POST 字段白名单校验，禁止远程修改 port/host/apiKeys/tls 等敏感字段
+- **新增**: 按 API Key / IP 的请求频率限制（滑动窗口，每分钟可配）
+- **新增**: 会话粘性（按 conversation_id 路由到同账号，保 prompt cache + 防风控）
+- **新增**: keep-alive / headers 空闲超时（默认 65s/60s 可调）
+- **新增**: TLS 自签证书一键生成（2 年有效期 + SAN 覆盖 localhost/127.0.0.1/::1/用户 host）
+- **新增**: stop() 优雅停止（5 秒优雅期 → activeRequests.abort → socket.destroy）
+- **新增**: 日志 sanitize（移除 Bearer/access_token/JWT/系统路径片段）
+
+**P2 高级特性**
+- **新增**: Prometheus `/metrics` 端点（8 个核心指标：requests/tokens/credits/accounts/uptime）
+- **新增**: 反代审计日志（滚动 200 条 + `/admin/audit` GET + `enableAuditLog` 开关）
+- **新增**: API Key 绑账号白名单（`apiKeyAccountBindings`：apiKey id → 允许的账号 id 数组）
+- **新增**: HTTP + HTTPS 双端口（启用 TLS 时通过 `fallbackPort` 同时监听 HTTP）
+- **新增**: `recentRequests` 上限可配置（默认 100，最多 10000）
+- **新增**: port/host/tls 变更标记需重启 + UI 一键重启按钮
+- **新增**: 流式响应 socket-level backpressure 监控
+
+**新文件**: `src/main/proxy/selfSignedCert.ts`、`ProxySecurityPanel.tsx`
+**新 IPC**: `proxySelfSignedCertInfo` / `proxySelfSignedCertRegenerate` / `proxyNeedsRestart` / `proxyRestart` / `proxyAuditLog` / `onProxyWebhookTrigger`
+
+#### 🌐 多协议代理支持
+
+- **新增**: SOCKS5 / SOCKS5h / SOCKS4 / SOCKS4a 代理支持（基于 `socks` 库 + undici 自定义 Agent + TLS 升级）
+- **新增**: 账号-代理 N:1 绑定（反代分桶，多账号共用 1 个 IP 降低风控关联）
+- **新增**: 账号的所有请求（含 token 刷新、background 检查、Kiro API）统一走绑定代理
+- **新增**: 代理池高级搜索（9 字段全文：host / port / protocol / user / label / email / url / tags / source）
+- **新增**: 代理池多维筛选（协议 / 启用状态 / 延迟范围 / 最后验证时间）+ 匹配数实时显示
+
+#### 🚀 批量注册重大升级
+
+**并发隔离修复**
+- **修复**: Outlook 批量并发邮箱抢占（前端预 shuffle outlookData + 每 task 独占一行；主进程兼容单行/多行）
+- **修复**: Mixed 模式源选择只生效一次（每 task 独立 `buildAutoConfig`，权重轮询真正生效）
+- **修复**: 注册历史"直连"误报（`resolvedProxyUrl()` 含系统/环境变量代理）
+
+**功能扩展**
+- **新增**: 限速器（token bucket）+ 指数退避 + 成功率监控
+- **新增**: 失败重试队列（按错误类型：network / otp_timeout / email_used / rate_limit / auth / risk_control）
+- **新增**: AWS 风控自动识别（"TEMPORARILY_SUSPENDED" / "请稍后再试"）+ 自动暂停批量
+- **新增**: 邮箱预校验黑名单（占用邮箱自动加入，跳过节省时间）
+- **新增**: 混合邮箱源加权轮询（SWRR / nginx 同款算法）
+- **新增**: 每日注册配额 + cron 定时启动
+- **新增**: 注册策略模板（保存/应用/导入/导出）
+- **新增**: 6-8 步动态进度条（根据 `batchAutoImport` 和 `autoFetchProLink` 自动增减）
+- **修复**: 注册过程中文乱码错误（tlsclientwrapper Latin-1 → UTF-8 重解码）
+- **移除**: MoEmail 注册功能（无用）
+
+#### 📊 任务中心 + Webhook 通知
+
+- **新增**: 统一任务中心（`useTaskStore`，标题栏入口 + 抽屉式 UI）
+- **新增**: 任务状态机：running / paused / success / failed / cancelled
+- **新增**: 任务中心持久化（完成的任务保存到 localStorage）
+- **新增**: 全部取消按钮 / 进度条 / 子任务详情
+- **新增**: Webhook 通知（钉钉 / Telegram / Discord / Slack / Generic JSON）
+- **新增**: Webhook 重试（3 次指数退避）+ 限流（20 条/分钟/webhook）
+- **新增**: 反代关键事件 → Webhook（封号 / 全员配额耗尽）
+
+#### 🩺 一键诊断
+
+- **新增**: 诊断页面（网络 / Kiro API / 邮箱服务 / 代理 / 自定义端点连通性）
+- **新增**: 自定义探测 URL（替代 MoEmail，可填任意 HTTP/HTTPS 端点）
+- **新增**: 通过代理执行诊断 + 报告导出（剪贴板）
+- **新增**: 老 MoEmail 配置自动迁移到新探测 URL key
+
+#### 🔧 订阅管理
+
+- **新增**: 批量订阅预检（资格检查 + 报告）
+- **新增**: 订阅取消 / 降级 / 续期入口
+- **新增**: 订阅链接有效期检测（HTTP HEAD 探测 + generatedAt 时间戳）
+- **新增**: 管理订阅 Tab（批量打开门户 + 一键关闭超额计费）
+- **新增**: 订阅账号虚拟列表（@tanstack/react-virtual）
+
+#### 📈 报表分析
+
+- **新增**: 注册结果分析报表（成功/失败圆环 + 24h 平滑曲线 + 7 日趋势）
+- **新增**: 错误分类统计（OTP 超时 / 网络 / 邮箱占用 / 限流 / 风控）
+- **新增**: CSV 导出
+
+#### 📦 配置导入导出
+
+- **新增**: 一键导出全量配置（账号 / 代理池 / Webhook / 策略模板）
+- **新增**: AES-GCM 加密导出（KCFG 格式，PBKDF2-SHA256 派生密钥）
+- **新增**: 跨设备配置同步
+
+#### ⚡ 性能优化（防卡顿）
+
+**I/O 与持久化**
+- **优化**: `saveToStorage` 500ms 防抖 + `flushSaveImmediately` 强制刷新接口
+- **优化**: `createBackup` 5 分钟节流（之前每次保存都备份）
+- **优化**: `ProxyLogStore` 异步 `fs.promises.writeFile` + 30 秒节流 + maxLogs 100 万 → 5 万
+- **优化**: `proxy-account-suspended` IPC 只更新内存快照，延迟落盘
+- **优化**: SSO 账号 `queueMicrotask` 异步加载（不阻塞 loadFromStorage）
+
+**渲染与计算**
+- **优化**: `getFilteredAccounts` / `getStats` / `activeAccount` 模块级 memoization
+- **优化**: `applyBackgroundRefreshResults` / `applyBackgroundCheckResults` 批量合并（120ms buffer）
+- **优化**: `importAccounts` / `importFromExportData` 单 set 调用
+- **优化**: `updateTrayInfo` 400ms 防抖
+- **优化**: `AccountToolbar` 选中状态 `useMemo` + `useCallback`
+- **优化**: 代理池 / 账号 / 订阅列表使用虚拟列表（`@tanstack/react-virtual`，仅渲染可视区域）
+
+#### 🐛 关键 Bug 修复
+
+- **修复**: `Invalid URL protocol`（Windows 注册表 ProxyServer 多协议字符串解析，仅取 HTTP/HTTPS）
+- **修复**: `tls-client-wrapper` DLL 改用 `userData/tls-client/` 永久存储（之前在 `%TEMP%` 会被系统清理）
+- **修复**: 网络请求 Latin-1 字符串响应转 UTF-8（中文错误正确显示）
+- **修复**: `proxyServer.stop()` socket 强制 destroy 太早导致响应截断
+- **修复**: 多个内存泄漏（限流桶 / 会话粘性条目 5 分钟自动清理）
+
+#### 🆕 新页面
+
+- **`ProxyPoolPage`** — 代理池管理 + 高级搜索 + 账号绑定 + 定时验活
+- **`WebhooksPage`** — Webhook 配置 + 测试 + 事件订阅
+- **`DiagnosePage`** — 一键诊断（网络 / API / 邮箱 / 代理 / 自定义）
+- **`ConfigSyncPage`** — 配置导入导出 + AES-GCM 加密
+
+#### 🔧 主题与 UI
+
+- **新增**: 任务中心按钮（标题栏）+ 全局进度展示
+- **新增**: 反代"安全与可观测设置 (v1.8)"卡片（折叠式，统一新配置入口）
+- **优化**: 失败错误码本地化显示
+- **优化**: 危险绑定（0.0.0.0）自动弹红色警告 + 风险确认开关
+
+#### 🔄 ProxyAccount 数据模型扩展
+
+- 新增 `proxyUrl` 字段（账号绑定的出口代理）
+- 新增 `machineId` 字段（账户绑定的设备 ID）
+
+#### 📋 ProxyConfig 新增字段（14 项）
+
+`maxRequestBodyBytes` / `allowedIPs` / `deniedIPs` / `allowExternalWithoutApiKey` / `rateLimitPerKeyPerMinute` / `sessionAffinityEnabled` / `keepAliveTimeoutMs` / `headersTimeoutMs` / `recentRequestsLimit` / `enableMetrics` / `apiKeyAccountBindings` / `fallbackPort` / `enableAuditLog` / `apiKeyGroupBindings`(deprecated)
+
+
+### v1.6.9 (2026-5-24)
+
+#### UI 全面主题适配
+- **重构**: 所有弹窗/卡片硬编码颜色统一替换为主题/语义令牌 — `text-green-500/600` → `text-success`、`text-red-500/600` → `text-destructive`、`text-amber/orange-500/600` → `text-warning`、`bg-blue-50/...` 等装饰色 → `bg-primary/[0.04~0.15]`
+- **影响范围**: AccountDetailDialog、AccountCard、AccountListRow、ModelsDialog、AccountSelectDialog、ProxyLogsDialog、ProxyDetailedLogsDialog、ApiKeyUsageDialog、ClientConfigDialog、EditAccountDialog、SteeringEditor、AddAccountDialog、ApiKeyManager、ProxyPanel 等 14+ 组件
+- **重构**: `_helpers.ts` 的 `getStatusBadgeClass` 状态色全部 token 化，支持自动深色模式适配
+- **优化**: 切换主题色后所有弹窗/卡片立即跟随，不再有"主题切换部分元素不变"的问题
+
+#### 账户卡片纯色背景
+- **新增**: `--card-solid` CSS 变量（浅色模式 `#FFFFFF` / 深色模式 `#1A2236`）— 账户卡片专用不透明背景
+- **新增**: `.bg-solid-card` utility class，配合双 class 选择器（`.glass-card.bg-solid-card`）覆盖玻璃态半透明背景，禁用 `backdrop-filter`
+- **修复**: 主题色（橙色等）透过 72% 半透明 `bg-card` 渗入账户数据区导致"被蒙一层主题色"的问题
+- **保留**: 其他玻璃态（dialog/popover/toolbar/sidebar/KIRO 配额卡）仍用 `bg-card` 半透明，玻璃质感不变
+
+#### 列表/卡片视图视觉优化
+- **重构**: 标签 chip 从实色填充改为半透明描边样式（12% 标签色背景 + 标签色文字 + 30% 标签色边框），视觉柔和不刺眼
+- **重构**: `generateRowGlowStyle` 单标签场景去掉横向背景渐变，只保留左边 3px 色带；多标签保留垂直渐变左边带
+- **修复**: 卡片/列表行选中态被多标签 inline style（`box-shadow`/`background`）覆盖导致选中无视觉反馈 — 改用绝对定位独立覆盖层（`absolute inset-0 ring-2 ring-inset ring-primary/60 bg-primary/[0.08] z-10`），与 inline style 隔离
+- **优化**: 选中状态强化为 `ring-2 ring-primary/60` + `bg-primary/[0.08]` + 主色阴影
+
+#### 分组功能改造（独立视图切换）
+- **新增**: `useAccountsStore` 增加 `activeGroupTab` state（`'all' | 'ungrouped' | <groupId>`），localStorage 持久化 — 取代原"多选筛选"逻辑
+- **新增**: `getFilteredAccounts()` 开头优先按 `activeGroupTab` 互斥过滤账号
+- **重构**: 工具栏"分组"按钮改为三合一菜单 — 切换视图 / 批量移动 / 管理分组
+  - 按钮文字动态显示当前 Tab 名 + 颜色圆点 + 计数
+  - 下拉菜单 2 列网格紧凑布局，节省垂直空间
+  - 用户分组列表只列一次（合并切换视图区和批量移动区）
+  - 选中账户时 hover tile 显示行尾 ⇄ 快捷按钮，点击批量移动到该组
+- **移除**: `AccountFilter.tsx` 中的分组 chip 多选区（避免与 Tab 双重控制冲突）
+- **修复**: 下拉菜单被卡片遮挡 — `<header>` 加 `relative z-20` 抬升 stacking context（`.glass-toolbar` 的 backdrop-filter 创建了独立 z 层，需显式提升）
+
+#### 账号管理工具栏紧凑化
+- **重构**: 6 个工具栏按钮（标签/隐私/筛选/检查/删除/刷新）改为纯图标 + tooltip 模式（`size="icon" h-8 w-8`），节省约 280px 宽度
+- **优化**: 标签按钮选中状态用主色小圆点（6px）替代 `ChevronDown`，更克制
+- **优化**: 删除按钮 hover 变 `bg-destructive/10` 红色警示
+- **优化**: tooltip 动态显示选中数量（如"删除选中的 5 个账号"），disabled 时提示"请先选中"
+- **新增**: 独立"清除选中" X 按钮（仅多选时显示），hover 红色提示
+- **保留**: 分组按钮（含当前 Tab 名）+ 全选按钮（含计数）保留文字（信息价值高）
+
+#### 注册页 Pro 计划自定义选择
+- **新增**: `ProPlanType` 类型 — Pro / Pro+ / Power 三种计划，对应 Kiro 后端 `Q_DEVELOPER_STANDALONE_{PRO|PRO_PLUS|POWER}` qSubscriptionType
+- **新增**: 注册页"自动获取 Pro 订阅链接"开关下方加三选一 chip 按钮（蓝/紫/金业务色），localStorage 持久化
+- **重构**: `fetchProSubscriptionUrl` 使用用户选择的计划类型替代硬编码 PRO
+
+#### 反代功能增强
+- **修复**: 多账号模式下"已过期 token 账号永远不刷新"bug — `accountPool.isAccountAvailable` 仅在**无 refreshToken**时才视为不可用，有 refreshToken 的过期账号让 `proxyServer.getAvailableAccount` 触发 `refreshToken`；刷新失败通过 `markNeedsRefresh` 自动隔离，形成闭环
+- **新增**: `ProxyConfig` 增加 `multiAccountSelectionMode: 'all' | 'groups'` 和 `multiAccountGroupIds: string[]` 字段
+- **新增**: 多账号轮询新增"轮询范围"配置 — 全部账号 / 指定分组（chip 多选含"未分组"特殊选项）
+- **新增**: `syncAccounts` 在多账号 + groups 模式下按选中分组过滤要同步的账号
+- **新增**: 反代页面 UI 加"轮询范围"切换 + 分组 chip（用户分组色 + 计数）+ 实时账号数预览
+- **同步**: preload IPC 类型同步（`multiAccountSelectionMode` / `multiAccountGroupIds` / `accountSelectionStrategy`）
+
+#### 反代页面 UI 紧凑化
+- **重构**: 基础配置 + API Key 合并为 1 行 12 列网格 — 端口(2) + 监听(3) + API Key(7)
+- **重构**: API Key 操作按钮（sk-xxx 格式选择 / 随机生成 / 复制 / 管理）全部 `icon-only h-7 w-7` 移到 Label 行右侧
+- **重构**: 高级配置从 2 列改为 3 列布局，所有 description `<p>` 标签移到 Label 的 `title` tooltip（节省 30-40% 纵向空间）
+- **重构**: Token Buffer 开关 + 数字输入合并为 `col-span-3` 一行（`[启用裁剪 160px][数字输入 flex-1]`）
+- **优化**: 模式开关行从 `flex-wrap` 改为 `grid-cols-3`，3 个开关（额度切换/记录日志/流式日志）共一行
+- **修复**: `sk-xxx` 下拉框 `h-6` 被 Select 内部 `py-2` 撑超导致内容被切 — 用 Tailwind 任意属性选择器 `[&>button]:h-7 [&>button]:py-0 [&>button]:px-2.5` 强制覆盖
+- **优化**: 高级配置标题加 `Settings2` 图标 + `uppercase tracking-wider` 小型化
+
+#### Bug 修复
+- **修复**: `AccountManager.tsx` 文件末尾多余 `}` 闭合括号导致 TypeScript 语法错误
+- **优化**: `AccountFilter.tsx` 清理未使用的 `groups` 解构变量
+
+### v1.6.8 (2026-5-23)
+
+#### Token 计量精度重构
+- **新增**: `tokenCounter.ts` 独立模块 — 封装 `js-tiktoken` 的 `cl100k_base` 编码器与 `getModelContextLength` 函数，统一处理所有 token 计算逻辑
+- **新增**: 多级精度链路 — Kiro 后端 `tokenUsage` 真实值 > `contextUsageEvent` 百分比反推（`modelCtx × percentage / 100`）> `tiktoken` 精算 > 字符系数兜底（input 0.42、output 0.4）
+- **优化**: 输入 token 估算精度从 ~30% 偏差降至 ~5%（Sonnet 4.5 实测 17871 → 19608，与官方 12.7% contextUsage 完美对齐）
+- **优化**: 输出 token 统计改为累积 `assistantResponseEvent` / `codeEvent` 文本后用 tiktoken 精算，不再依赖输出字符长度
+- **新增**: `getModelContextLength` 三级查找链 — Kiro `fetchKiroModels` 返回的真实 `maxInputTokens` 缓存优先 → 模糊匹配（`claude-sonnet-4.5` ↔ `claude-sonnet-4-5-20251001`）→ 关键词兜底（sonnet/haiku/opus/gpt-4 等）
+- **新增**: AmazonQ CLI 端点 `CodeEvent` 解析支持 — 修复该端点流式输出代码内容丢失的问题
+- **优化**: `parseEventStream` 签名扩展，接收 `modelId` 与 `payloadStr` 参数，端到端贯通模型上下文供 contextUsage 反推使用
+- **修复**: `kiroApi.ts` 中重复定义的 `modelContextWindowCache` 移除，统一从 `tokenCounter.ts` 导入并 re-export 保持向后兼容
+
+#### Token Buffer Reserve 开关化（默认关闭）
+- **变更**: ⚠️ **`tokenBufferReserve` 行为变更** — v1.6.7 强制启用预留 50K，v1.6.8 改为可选开关，**默认关闭**，开启时默认值降为 20K
+- **新增**: `enableTokenBufferReserve` 独立开关 — `ProxyConfig` 新增字段，前端 UI 加内嵌 Switch 控件
+- **行为**: 关闭时 `trimHistoryByTokens` **完全跳过**，超出 context window 由 Kiro 后端直接返回 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 错误，反代原样转发给客户端
+- **行为**: 开启时 effective limit = `model.maxInputTokens - tokenBufferReserve`（200K → 180K, 1M → 980K，取值范围 5K~150K）
+- **UI**: 数字输入框 disable 条件追加 `!enableTokenBufferReserve` — 开关关闭时输入框自动置灰；运行中所有相关控件锁定
+- **兼容**: 存量配置中 50K 等历史值会保留（仍在 5K~150K 区间），但因开关默认 false 不会立即触发裁剪，用户需手动开启
+
+#### 代理 URL 容错
+- **新增**: `normalizeProxyUrl` 工具函数 — 自动规范化用户输入的非标准代理 URL（如 `http:127.0.0.1:7890` 缺 `//`、`127.0.0.1:7890` 缺协议、首尾空格等）统一补齐为标准 `http://host:port` 格式
+- **优化**: 环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`）、Electron `session.setProxy`、前端 UI 三处统一使用规范化后的 URL，避免代理失效或重复设置
+- **优化**: IPC `set-proxy` 返回 `normalizedUrl` 给前端 store，自动回写到 UI 输入框显示规范化结果
+
+#### 功能精简
+- **移除**: 「自动继续轮数 / 服务端工具自动继续」完整功能链路 — 14 处引用清零（前端 UI 控件、`ProxyConfig` 字段、IPC `proxyStart`/`proxyUpdateConfig` 类型签名、后端 OpenAI `handleOpenAIStream` 与 Claude `handleClaudeStream` 流式 auto-continue 触发分支）
+- **行为**: 流式工具调用走完后直接返回 `tool_calls` / `tool_use` 给客户端，由客户端决定后续动作，不再有服务端「伪造继续」的递归调用路径
+- **理由**: 该功能与主流 API 客户端（Cline / Roo / Cursor / Claude Code）的工具执行循环冲突，且与 `clientDrivenToolExecution=true`（推荐配置）互斥，长期不被使用
+
+#### Bug 修复
+- **修复**: 🔥 `electron-builder` 构建报错 `ENOENT: no such file or directory, rename 'electron.exe' -> 'kiro-account-manager.exe'` — 根因为 npmmirror 镜像下载的 `electron-v38.7.2-win32-x64.zip` 不完整导致 Electron 二进制损坏，改用 BITS 从 `cdn.npmmirror.com/binaries/electron/` 下载完整 zip 解决
+- **修复**: 注册流程 `app.js` 下载触发 `RangeError: init["status"] must be in the range of 200 to 599, inclusive.` — `tlsclientwrapper` 在网络错误时返回 `status=0/undefined`，触发 `new Response()` 校验异常。改用 `undici fetch` 直接获取静态资源 `app.js`，绕过 tls-client 避免污染其全局状态
+- **修复**: 启用代理后 OIDC 注册失败 `failed to build client out of request input: failed to modify existing client: no tls client for modification check` — `app.js` 下载失败连带污染了 tls-client DLL 全局状态，后续 `SessionClient` 初始化失败。`app.js` 改用 undici 后该问题自动消除
+- **修复**: 前端 `setProxy` 改为 async 函数 — 等待 IPC 返回规范化后的 URL 并回写 store 显示，避免 UI 与实际生效值不一致
+
+### v1.6.7 (2026-5-23)
+
+#### 账号封禁处理 (核心新功能)
+- **新增**: 完整的 TEMPORARILY_SUSPENDED 检测链路 — 反代识别 Kiro 后端风控错误（`403 + reason:"TEMPORARILY_SUSPENDED"`）、`AccountSuspendedException`（CodeWhisperer）、`423 Locked` 三类响应
+- **新增**: `ProxyAccount` 增加 `suspendedAt` / `suspendReason` / `suspendMessage` 字段，跟踪长期封禁状态（区分于临时 `errorCount` 冷却）
+- **新增**: `AccountPool` 增加 `isSuspended` / `markSuspended` / `clearSuspended` 三个方法 — 被封禁账号在 `isAccountAvailable` 中永久跳过，直到手动解封或调用 `reset()`
+- **新增**: `onAccountSuspended` 事件 + IPC `proxy-account-suspended` — 完整桥接 proxy server → main → preload → renderer store → UI
+- **新增**: 封禁状态持久化到 `store.accountData[id].lastError` 和 `status='error'`，应用重启后仍然可见
+- **新增**: 检测到当前账号被封禁时自动切换到下一可用账号（多账号模式和单账号 + 自动切换模式均生效）
+- **改进**: 统一 `isBannedAccountError` 函数 — `store/accounts.ts` / `AccountSelectDialog` / `AccountCard` 三处全部识别 `temporarily_suspended` / `temporarily suspended` / `User ID is suspended` 模式并显示封禁标记
+- **新增**: 手动解封 UI — `AccountCard` 封禁详情弹窗新增「重置封禁状态」按钮，调用 IPC `proxy-clear-account-suspended` → 同时清除反代池 suspended 标记 + 清除 `store.accountData[id].lastError` + 设置 `status='active'`
+- **修复**: `accountPool.addAccount` 之前总是强制设置 `isAvailable=true`，会静默丢失账号重新 add 时带的 suspended 状态（如 `proxy-sync-accounts` 后）。现在 `addAccount` 尊重传入的 `suspendedAt` 字段，保留 `isAvailable=false`，从持久化数据重新加入的被封账号仍被正确跳过。
+
+#### 局域网访问修复 (Issue #75)
+- **修复**: 🔥 **从 1.5.0 升级到 1.6.x 后无法通过局域网访问反代** — 根因：默认 `host` 是 `127.0.0.1`（仅 loopback），且 UI 的「外网」Switch 在反代运行时被 `disabled`，用户无法切换必须停服
+- **修复**: 反代面板的「外网」Switch 现在运行中也可点击 — 切换时自动 stop + start 反代，~300ms 内新 host 生效
+- **改进**: 服务地址显示从 `http://0.0.0.0:5580` 改为 `http://localhost:5580`（前者不是有效的客户端目标地址），复制按钮也使用人类可读形式
+- **改进**: Host 字段下方新增动态提示 — loopback 模式提示如何开启外网访问；外网模式警告需设置 API Key 并放行防火墙端口
+- **改进**: 开启外网模式时，服务地址下方额外显示 `局域网设备请使用 http://<本机IP>:<端口>`
+
+#### UI 优化
+- **新增**: 🎨 **高级 SaaS 玻璃态全面重设计** — 致敬 Linear / Raycast / Vercel 风格的设计系统重构：
+  - **设计令牌**：背景 `#f4f7fb`、主色 `#5B8CFF`、紫辅 `#8B5CF6`、成功色 `#22C55E`、半透明白边框 `rgba(255,255,255,0.4)`
+  - **磨砂玻璃系统**：新增 `.glass-card` / `.glass-card-strong` / `.glass-card-subtle` / `.glass-sidebar` / `.glass-toolbar` 工具类，`backdrop-filter: blur(24px) saturate(180%)`
+  - **悬浮侧边栏**：圆角 24px、玻璃背景、framer-motion spring 宽度动画、激活态采用 layoutId 形变药丸（主色 → 紫辅渐变）
+  - **环境光背景**：双径向渐变（蓝 + 紫）配合 22s/26s 浮动 keyframes，80px 柔光，深色模式自动降透明度
+  - **Card 默认**：`<Card>` 默认 glass variant + `rounded-2xl` (24px)，支持 `variant=glass/glass-strong/glass-subtle/solid/elevated` 与 `interactive` 属性（hover 浮起 -2px + 阴影增强）
+  - **页面 Hero 统一**：8 个页面（首页/账号/设置/反代/K-Proxy/Kiro设置/订阅/注册/关于/机器码）全部使用 `.page-hero` 工具类，24px 圆角玻璃页头
+  - **透明工具栏**：AccountManager 顶部 header 改用 `glass-toolbar`（16px blur + 半透明 + 仅底边线）
+  - **页面切换**：`AnimatePresence` + `motion.div` 包裹页面，路由切换时 fade + 8px Y 轴 spring 过渡
+  - **深色模式**：深海军蓝 `#0a0e1a` 背景配合调优后的玻璃面板，弱光环境下可读性更佳
+  - **依赖**：新增 `framer-motion ^11.x` 支持声明式动画
+- **修复（玻璃态打磨）**：页面滚动失效回归 — `motion.div` 包装器加上 `h-full flex flex-col`，确保子页面的 `flex-1 overflow-auto` 重新生效
+- **优化（玻璃态打磨）**：
+  - `HomePage` / `SettingsPage` / `AboutPage` / `RegisterPage` / `KiroSettingsPage` / `ProxyPanel` 中所有 33 处 `<Card className="border-0 shadow-sm hover:shadow-md transition-shadow duration-200">` 全部替换为 `hover-lift` — Card 默认 glass variant 完全显现
+  - 4 个手写 div 风格的 Dialog 容器（`UpdateDialog` / `CloseConfirmDialog` / `AccountDetailDialog` / `ProxyDetailedLogsDialog`）从 `bg-background rounded-xl border` 换为 `glass-card-strong rounded-2xl` + 遮罩 backdrop-blur
+  - `Button` 组件全面翻新：默认 `rounded-xl`、`transition-all 200ms`，`default`/`destructive` variants 加 hover `-translate-y-px` + 主色辉光环；新增 `gradient` variant（主题渐变背景 + breathe-glow 呼吸动画）；新增 `cta` size（h-12 rounded-2xl，用于主 Call-to-Action）
+  - **21 个主题色全部配套定义 active-pill 渐变对** — 每个主题独立定义 `--gradient-from` / `--gradient-to`（紫/翠/橙/玫瑰/青/琥珀/水鸭/靖/青柠/粉/灰/晴空/紫罗兰/洋红/红/黄/绿/暖灰/中性灰 + default）。Sidebar 的 `motion.span layoutId="sidebar-active-pill"` 读取 CSS var，激活药丸跟随主题色谐和渐变（如翠绿主题 → 翠→青青渐变，不再固定蓝→紫）
+  - `gradient-bg-primary` 和 `gradient-border` 工具类改用 `var(--gradient-from/-to)`，所有渐变按钮/边框自动跟随主题切换
+- **优化（玻璃质感精修）**：
+  - **玻璃阴影 4 层合成**：顶部 1px 白色高光（inset）+ 1px slate-900 @ 4% 外描边 + 0 8px 32px @ 12% 远阴影 + 0 2px 6px @ 5% 近阴影 — 让卡片在浅色背景上有真实的「磨砂亚克力」实物感（之前纯半透明在白底上视觉无差）
+  - **页面光晕渗透**：`main` 容器加 `.page-surface`（双色 18%/14% 蓝紫径向 blob，60px blur），让玻璃卡片有色彩可折射 — 之前白底白卡视觉无对比
+  - **AccountCard 重构**：移除多余的 `border` + `hover:shadow-lg` 覆盖（被 glass 系统覆盖）；非 active/非封禁卡片改用 `hover-lift` 工具类（translateY -2px + 增强阴影）；流光边框与封禁红边保留
+  - **AccountToolbar 输入框**：搜索框、视图切换组按钮改用 `bg-[var(--glass-bg-subtle)] backdrop-blur-md` + rounded-xl + 大焦点环；AccountFilter 中 number input 同处理
+- **新增**: 账号管理页新增**列表视图** — 工具栏增加「卡片/列表」切换按钮，选择持久化到 `localStorage('accounts_viewMode')`。紧凑列表行同行显示邮箱 + 状态 + 订阅 + 标签 + 额度进度 + 快捷操作，密度是卡片的 ~5 倍（适合管理 100+ 账号）
+- **修复**: 系统日志页面的「显示数量」默认值从「全部」改为「5K」，并持久化到 `localStorage('systemLogs_displayLimit')` — 之前用户修改后切页或重启会重置为「全部」，在日志量大时冷启渲染特别慢
+
+#### Token 维度历史裁剪
+- **新增**: `tokenBufferReserve` 配置（替代之前的 `maxInputTokensThreshold`）— 根据 `ListAvailableModels` 返回的真实 `contextWindow` 自适应裁剪
+- **变更**: 每次请求的有效裁剪阈值 = `model.maxInputTokens - tokenBufferReserve`，默认预留 `50000` 适配所有模型（200K 模型 → 150K 阈值，1M 模型 → 950K 阈值）
+- **新增**: 预留 token 覆盖 `system` + `tools` + 当前消息 + 输出额度 + 估算偏差，无论 byte 维度的 payload size 多大都能避免 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 错误
+- **新增**: 模型 context 缓存从 `fetchKiroModels` 同步到裁剪逻辑，Kiro 新增模型可自动获取正确上下文窗口
+
+#### 弹窗玻璃态系统重构
+- **重构**: 17 个 dialog 统一使用 `.glass-card-strong` — `Card` 重写为 90% 半透白底（`rgba(255,255,255,0.90)` / 深色 `rgba(20,25,40,0.90)`）+ `backdrop-filter: blur(20px) saturate(160%)` 真实磨砂玻璃 + 三层合成深阴影（1px 微外描边 + 0 24px 64px 远阴影 + 0 8px 24px 近接触影）让弹窗有强浮起感
+- **统一**: dialog 背景遮罩从原 `bg-black/40 backdrop-blur-sm` / `bg-black/50` 改为 `bg-slate-900/[0.12] dark:bg-black/50 backdrop-blur-xl`，浅色 12% slate 极淡蒙板 + 强模糊（24px）— 背景虚化但不拉灰 dialog 采样
+- **统一**: 所有 dialog 右上角关闭按钮（×）统一红色 hover — `hover:bg-red-500 hover:text-white transition-colors`，覆盖 `AccountDetailDialog` / `EditAccountDialog` / `AddAccountDialog` / `TagManageDialog` / `GroupManageDialog` / `ExportDialog` / `AccountCard` 封禁+订阅 / `ApiKeyUsageDialog` / `AccountSelectDialog` / `UpdateDialog` 等 15+ 个 dialog，与 TitleBar 危险关闭保持一致语义
+- **改进**: `--glass-bg-strong` token 从纯白实色改为 90% 半透 + `backdrop-filter` 真正生效，dialog 不再是不透明白卡片而是带玻璃质感
+
+#### 主题底色 & 氛围光优化
+- **设计**: 浅色主背景从 `#f4f7fb` → `#EEF2F8` 冰白蓝调（参考 F1 清新蓝），减少「AI 配色」死白感
+- **设计**: 深色主背景从 `#0a0e1a` → `#0B1220` 深空蓝（参考 E1），改为蓝调而非中性灰黑
+- **新增**: `body` 三段渐变 — 浅色顶部 `#E5EBF5` → 中部 `#EEF2F8` → 底部 `#F2F5FA` 模拟天光过渡；深色顶部 `#0F1729` → 中部 `#0B1220` → 底部 `#060A14` 夜空深邃感
+- **新增**: body 渐变顶/底用 `color-mix(in srgb, var(--gradient-from) 10%, ...)` 染上主题色，**主题切换时整个底色跟随**（之前主题只影响按钮，不影响背景氛围）
+- **改进**: ambient blob 颜色从硬编码 `rgba(91,140,255,0.55)` 蓝紫改为 `color-mix(var(--gradient-from) 38%, transparent)` — 切换主题后呼吸光晕也跟随主题色相，蓝/紫/绿/橙/金各主题视觉氛围独立
+- **改进**: titlebar 浅色玻璃从 `rgba(255,255,255,0.75) → rgba(244,247,251,0.65)` 改为 `rgba(255,255,255,0.78) → rgba(229,235,245,0.65)`；深色从中性深灰改为深空蓝调 `rgba(22,30,48,0.85) → rgba(11,18,32,0.75)`
+- **修复**: App 根 `<div>` 去除 `bg-background` 实色 class — 之前覆盖 body 渐变，导致渐变背景看不见
+
+#### 主题色扩展 — 新增 11 个高级主题（共 32 种）
+- **新增**: 「奢华配色」分组 4 个 — `gold` 奢华金 `#C9A227` / `navy` 海军蓝 `#1E40AF` / `wine` 酒红 `#9F1239` / `champagne` 香槟 `#B89968`，适合金融、商务、奢侈品风格场景
+- **新增**: 「莫兰迪色系」分组 4 个 — `dustyblue` 烟雾蓝 `#64748B` / `terracotta` 陶土橙 `#B45434` / `sage` 鼠尾草 `#6B8E5A` / `mauve` 烟紫 `#8E7CC3`，高级灰调降饱和，长时间使用不疲劳
+- **新增**: 「自然深色」分组 3 个 — `coral` 珊瑚粉 `#F87171` / `forest` 森林绿 `#166534` / `ocean` 深海青 `#155E75`，沉静自然质感
+- **改进**: 每个新主题配套深色模式独立色值（如 `forest` 浅色 `#166534` 深色 `#4ADE80`），保证 WCAG 对比度
+- **同步**: `accounts.ts` 主题切换时移除列表加入 11 个新类；`zh.ts` / `en.ts` / `AboutPage.tsx` 中 "21 种主题" → "32 种主题"
+
+#### 额度统计进度条增强
+- **新增**: 进度条上方右侧增加**实时百分比药丸** — 按使用率分级变色：< 50% 绿、50-80% 黄、80-100% 橙、> 100% 红
+- **新增**: 超额时进度条采用**双段视觉化** — 基础段（0-100% 填满，按使用率分级颜色）+ 右侧叠加深红条纹超额段（`animate-pulse` + 45° `repeating-linear-gradient` 斜纹），超额段视觉宽度按相对超额比例计算（最多 60% 避免完全遮盖）
+- **新增**: 超额时进度条下方追加**红色警示横幅** — 显示「⚠️ 已超额 +X.XX%」+「超额积分：Y 积分」，使用 `bg-red-500/10` + `border-red-500/30` 区域强调
+- **改进**: 百分比和超额比例都跟随 `usagePrecision` 设置（开启时 2 位小数，关闭时 1 位）
+
 ### v1.6.6 (2026-5-17)
 
 #### E2E 测试套件

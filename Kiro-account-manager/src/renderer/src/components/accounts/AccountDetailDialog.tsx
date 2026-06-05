@@ -139,28 +139,29 @@ export function AccountDetailDialog({
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
 
-      <div className="relative bg-background rounded-xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto m-4 animate-in zoom-in-95 duration-200 border">
+      <div className="relative glass-card-strong rounded-2xl shadow-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto m-4 animate-in zoom-in-95 duration-200">
         {/* 头部 */}
-        <div className="sticky top-0 bg-background/95 backdrop-blur z-20 border-b p-4 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center shadow-inner">
-              <User className="h-6 w-6 text-primary" />
+        <div className="sticky top-0 z-20 px-6 py-5 border-b border-white/30 dark:border-white/10 bg-gradient-to-br from-primary/[0.08] via-primary/[0.04] to-transparent backdrop-blur-xl flex items-center justify-between">
+          <div className="flex items-center gap-4 min-w-0 flex-1">
+            <div className="relative w-14 h-14 rounded-2xl bg-gradient-to-br from-[var(--gradient-from)] to-[var(--gradient-to)] flex items-center justify-center shadow-lg shadow-primary/30 shrink-0">
+              <User className="h-7 w-7 text-white" />
+              <div className="absolute -bottom-1 -right-1 w-4 h-4 rounded-full bg-success border-2 border-background" />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-lg truncate max-w-[300px]" title={account.email || getDisplayName(account)}>{account.email ? maskEmail(account.email) : getDisplayName(account)}</span>
-                <Badge className={cn(getSubscriptionColor(subscription.type, subscription.title), "hover:opacity-90 text-white shadow-sm flex-shrink-0")}>
+              <div className="flex items-center gap-2 mb-1.5">
+                <span className="font-bold text-lg text-foreground truncate" title={account.email || getDisplayName(account)}>{account.email ? maskEmail(account.email) : getDisplayName(account)}</span>
+                <Badge className={cn(getSubscriptionColor(subscription.type, subscription.title), "hover:opacity-90 text-white shadow-md flex-shrink-0 px-2.5")}>
                   {subscription.title || subscription.type}
                 </Badge>
               </div>
-              <div className="flex items-center gap-2 mt-1 text-xs text-muted-foreground">
-                 <span className="px-1.5 py-0.5 bg-muted rounded-md font-medium">{account.idp}</span>
-                 <span>·</span>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                 <span className="px-2 py-0.5 bg-background/70 backdrop-blur-sm rounded-md font-medium border border-border/50">{account.idp}</span>
+                 <span className="opacity-50">·</span>
                  <span>{isEn ? 'Added ' : '添加于 '}{formatDate(account.createdAt)}</span>
               </div>
             </div>
           </div>
-          <Button variant="ghost" size="icon" onClick={() => onOpenChange(false)} className="rounded-full hover:bg-muted">
+          <Button variant="ghost" size="icon" onClick={() => onOpenChange(false)} className="rounded-full hover:bg-red-500 hover:text-white transition-colors shrink-0">
             <X className="h-5 w-5" />
           </Button>
         </div>
@@ -171,7 +172,9 @@ export function AccountDetailDialog({
           <section className="space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="flex items-center gap-2 font-bold text-base text-foreground">
-                <CreditCard className="h-5 w-5 text-primary" />
+                <div className="p-1.5 rounded-lg bg-primary/10">
+                  <CreditCard className="h-4 w-4 text-primary" />
+                </div>
                 {isEn ? 'Quota Overview' : '配额总览'}
               </h3>
               {onRefresh && (
@@ -182,21 +185,22 @@ export function AccountDetailDialog({
               )}
             </div>
 
-            <div className="bg-muted/30 border rounded-xl p-5 space-y-4">
+            <div className="bg-gradient-to-br from-primary/[0.04] via-transparent to-primary/[0.04] border border-primary/15 rounded-2xl p-5 space-y-5 shadow-sm">
                {/* 总使用量 */}
                <div>
-                 <div className="flex items-end justify-between mb-2">
+                 <div className="flex items-end justify-between mb-3">
                    <div className="space-y-1">
-                     <div className="text-sm text-muted-foreground font-medium">{isEn ? 'Total Usage' : '总使用量'}</div>
+                     <div className="text-xs text-muted-foreground font-semibold uppercase tracking-wider">{isEn ? 'Total Usage' : '总使用量'}</div>
                      <div className="flex items-baseline gap-1.5">
-                       <span className="text-3xl font-bold tracking-tight text-foreground">{formatUsage(usage.current)}</span>
+                       <span className="text-4xl font-bold tracking-tight bg-gradient-to-br from-[var(--gradient-from)] to-[var(--gradient-to)] bg-clip-text text-transparent">{formatUsage(usage.current)}</span>
                        <span className="text-lg text-muted-foreground font-medium">/ {formatUsage(usage.limit)}</span>
                      </div>
                    </div>
                    <div className={cn(
-                     "text-sm font-semibold px-2.5 py-1 rounded-lg",
-                     usage.percentUsed > 0.9 ? "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400" : 
-                     "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400"
+                     "text-sm font-bold px-3 py-1.5 rounded-full border shadow-sm",
+                     usage.percentUsed > 0.9 
+                       ? "bg-destructive/10 text-destructive border-destructive/30" 
+                       : "bg-success/10 text-success border-success/30"
                    )}>
                      {(usage.percentUsed * 100).toFixed(usagePrecision ? 2 : 1)}% {isEn ? 'used' : '已使用'}
                    </div>
@@ -206,9 +210,9 @@ export function AccountDetailDialog({
 
                <div className="grid grid-cols-3 gap-4 pt-2">
                  {/* 主配额 */}
-                 <div className="p-4 bg-background rounded-xl border shadow-sm">
-                   <div className="flex items-center gap-2 text-xs font-semibold text-blue-600 dark:text-blue-400 mb-2">
-                     <div className="w-2 h-2 rounded-full bg-blue-500" />
+                 <div className="p-4 bg-background/60 backdrop-blur-sm rounded-xl border border-primary/15 hover:border-primary/30 hover:bg-background/80 hover:shadow-md transition-all shadow-sm">
+                   <div className="flex items-center gap-2 text-xs font-semibold text-primary mb-2">
+                     <div className="w-2 h-2 rounded-full bg-primary shadow-sm shadow-primary/50" />
                      {isEn ? 'Base' : '主配额'}
                    </div>
                    <div className="text-xl font-bold tracking-tight">
@@ -220,9 +224,9 @@ export function AccountDetailDialog({
                  </div>
                  
                  {/* 免费试用 */}
-                 <div className={cn("p-4 bg-background rounded-xl border shadow-sm", (usage.freeTrialLimit ?? 0) === 0 && "opacity-60 grayscale")}>
-                   <div className="flex items-center gap-2 text-xs font-semibold text-purple-600 dark:text-purple-400 mb-2">
-                     <div className="w-2 h-2 rounded-full bg-purple-500" />
+                 <div className={cn("p-4 bg-background/60 backdrop-blur-sm rounded-xl border border-warning/15 hover:border-warning/30 hover:bg-background/80 hover:shadow-md transition-all shadow-sm", (usage.freeTrialLimit ?? 0) === 0 && "opacity-60 grayscale")}>
+                   <div className="flex items-center gap-2 text-xs font-semibold text-warning mb-2">
+                     <div className="w-2 h-2 rounded-full bg-warning shadow-sm shadow-warning/50" />
                      {isEn ? 'Trial' : '免费试用'}
                      {(usage.freeTrialLimit ?? 0) > 0 && <Badge variant="secondary" className="text-[10px] px-1 h-4 ml-auto">ACTIVE</Badge>}
                    </div>
@@ -235,9 +239,9 @@ export function AccountDetailDialog({
                  </div>
 
                  {/* 奖励总计 */}
-                 <div className={cn("p-4 bg-background rounded-xl border shadow-sm", bonusTotal === 0 && "opacity-60 grayscale")}>
-                   <div className="flex items-center gap-2 text-xs font-semibold text-cyan-600 dark:text-cyan-400 mb-2">
-                     <div className="w-2 h-2 rounded-full bg-cyan-500" />
+                 <div className={cn("p-4 bg-background/60 backdrop-blur-sm rounded-xl border border-success/15 hover:border-success/30 hover:bg-background/80 hover:shadow-md transition-all shadow-sm", bonusTotal === 0 && "opacity-60 grayscale")}>
+                   <div className="flex items-center gap-2 text-xs font-semibold text-success mb-2">
+                     <div className="w-2 h-2 rounded-full bg-success shadow-sm shadow-success/50" />
                      {isEn ? 'Bonus' : '奖励总计'}
                    </div>
                    <div className="text-xl font-bold tracking-tight">
@@ -286,10 +290,12 @@ export function AccountDetailDialog({
              {/* 基本信息 */}
              <section className="space-y-3">
                <h3 className="flex items-center gap-2 font-bold text-base text-foreground">
-                 <User className="h-5 w-5 text-primary" />
+                 <div className="p-1.5 rounded-lg bg-primary/10">
+                   <User className="h-4 w-4 text-primary" />
+                 </div>
                  {isEn ? 'Basic Info' : '基本信息'}
                </h3>
-               <div className="bg-muted/30 border rounded-xl p-4 space-y-4">
+               <div className="bg-gradient-to-br from-primary/[0.04] to-transparent border border-primary/15 rounded-2xl p-5 space-y-4 shadow-sm">
                  <div className="space-y-1">
                    <label className="text-xs font-medium text-muted-foreground">{isEn ? 'Email/ID' : '邮箱/ID'}</label>
                    <div className="text-sm font-mono break-all select-all">{account.email ? maskEmail(account.email) : getDisplayName(account)}</div>
@@ -306,31 +312,35 @@ export function AccountDetailDialog({
                  </div>
                  <div className="space-y-1">
                     <label className="text-xs font-medium text-muted-foreground">{isEn ? 'User ID' : '用户 ID'}</label>
-                    <div className="text-xs font-mono break-all bg-background p-2 rounded border select-all">{privacyMode ? '********' : (account.userId || '-')}</div>
+                    <div className="text-xs font-mono break-all bg-primary/[0.06] px-3 py-2 rounded-lg border border-primary/15 select-all text-foreground/80">{privacyMode ? '********' : (account.userId || '-')}</div>
                  </div>
+                 {/* 代理绑定（B4） */}
+                 <ProxyBindingSection accountId={account.id} accountEmail={account.email || ''} isEn={isEn} />
                </div>
              </section>
 
              {/* Token 凭证 */}
              <section className="space-y-3">
                <h3 className="flex items-center gap-2 font-bold text-base text-foreground">
-                 <Key className="h-5 w-5 text-primary" />
+                 <div className="p-1.5 rounded-lg bg-primary/10">
+                   <Key className="h-4 w-4 text-primary" />
+                 </div>
                  {isEn ? 'Subscription' : '订阅详情'}
                </h3>
-               <div className="bg-muted/30 border rounded-xl p-4 text-sm space-y-3">
-                 <div className="flex justify-between items-center py-1 border-b border-border/50">
+               <div className="bg-gradient-to-br from-primary/[0.04] to-transparent border border-primary/15 rounded-2xl p-5 text-sm space-y-3 shadow-sm">
+                 <div className="flex justify-between items-center py-1 border-b border-primary/10 last:border-0">
                    <span className="text-muted-foreground text-xs">Region</span>
                    <Badge variant="outline" className="font-mono">{credentials.region || 'us-east-1'}</Badge>
                  </div>
-                 <div className="flex justify-between items-center py-1 border-b border-border/50">
+                 <div className="flex justify-between items-center py-1 border-b border-primary/10 last:border-0">
                    <span className="text-muted-foreground text-xs">{isEn ? 'Token Expires' : 'Token 到期'}</span>
                    <span className="font-medium text-xs">{credentials.expiresAt ? formatDateTime(credentials.expiresAt) : '-'}</span>
                  </div>
-                 <div className="flex justify-between items-center py-1 border-b border-border/50">
+                 <div className="flex justify-between items-center py-1 border-b border-primary/10 last:border-0">
                    <span className="text-muted-foreground text-xs">{isEn ? 'Plan Type' : '订阅类型'}</span>
                    <span className="font-mono text-xs" title={subscription.rawType}>{subscription.rawType || '-'}</span>
                  </div>
-                 <div className="flex justify-between items-center py-1 border-b border-border/50">
+                 <div className="flex justify-between items-center py-1 border-b border-primary/10 last:border-0">
                    <span className="text-muted-foreground text-xs">{isEn ? 'Overage Rate' : '超额费率'}</span>
                    <span className="font-mono text-xs">
                      {usage.resourceDetail?.overageRate 
@@ -338,15 +348,15 @@ export function AccountDetailDialog({
                        : '-'}
                    </span>
                  </div>
-                 <div className="flex justify-between items-center py-1 border-b border-border/50">
+                 <div className="flex justify-between items-center py-1 border-b border-primary/10 last:border-0">
                    <span className="text-muted-foreground text-xs">{isEn ? 'Resource Type' : '资源类型'}</span>
                    <span className="font-mono text-xs">{usage.resourceDetail?.resourceType || '-'}</span>
                  </div>
                  <div className="flex justify-between items-center py-1">
                    <span className="text-muted-foreground text-xs">{isEn ? 'Upgradable' : '可升级'}</span>
-                   <span className={cn("text-xs font-bold", subscription.upgradeCapability === 'UPGRADE_CAPABLE' ? "text-green-600" : "text-muted-foreground")}>
+                   <Badge variant="outline" className={cn("text-[10px] px-2 h-5 font-bold", subscription.upgradeCapability === 'UPGRADE_CAPABLE' ? "bg-success/10 text-success border-success/30" : "bg-muted text-muted-foreground border-border")}>
                       {subscription.upgradeCapability === 'UPGRADE_CAPABLE' ? 'YES' : 'NO'}
-                   </span>
+                   </Badge>
                  </div>
                </div>
              </section>
@@ -355,7 +365,9 @@ export function AccountDetailDialog({
           {/* 账户可用模型 */}
           <section className="space-y-3">
             <h3 className="flex items-center gap-2 font-bold text-base text-foreground">
-              <Cpu className="h-5 w-5 text-primary" />
+              <div className="p-1.5 rounded-lg bg-primary/10">
+                <Cpu className="h-4 w-4 text-primary" />
+              </div>
               {isEn ? 'Available Models' : '账户可用模型'}
               <Badge className="ml-auto bg-primary/10 text-primary border-primary/20">{models.length}</Badge>
             </h3>
@@ -441,5 +453,90 @@ export function AccountDetailDialog({
       </div>
     </div>,
     document.body
+  )
+}
+
+/** 账号详情对话框内的"代理绑定"段（B4 边缘修复） */
+function ProxyBindingSection({ accountId, accountEmail, isEn }: { accountId: string; accountEmail: string; isEn: boolean }): React.ReactNode {
+  const { proxyPool, accountProxyBindings, bindAccountsToProxy, unbindAccountFromProxy } = useAccountsStore()
+  const [open, setOpen] = useState(false)
+
+  const boundProxyId = accountProxyBindings[accountId]
+  const boundProxy = boundProxyId ? proxyPool.get(boundProxyId) : null
+
+  const aliveProxies = Array.from(proxyPool.values()).filter((p) => p.enabled && p.status !== 'dead')
+
+  return (
+    <div className="space-y-1 mt-3">
+      <label className="text-xs font-medium text-muted-foreground">{isEn ? 'Bound Proxy (Reverse Proxy)' : '反代绑定代理'}</label>
+      {boundProxy ? (
+        <div className="flex items-center gap-2 bg-cyan-500/10 border border-cyan-500/30 px-3 py-2 rounded-lg">
+          <span className="text-cyan-700 dark:text-cyan-300 text-xs font-mono flex-1 truncate" title={boundProxy.url}>
+            {boundProxy.protocol}://{boundProxy.host}:{boundProxy.port}
+            {boundProxy.label && <span className="text-muted-foreground ml-1.5">({boundProxy.label})</span>}
+          </span>
+          <Badge variant="outline" className="text-[10px]">{boundProxy.status}</Badge>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => setOpen(!open)}
+            className="h-7 text-xs"
+          >
+            {isEn ? 'Change' : '更换'}
+          </Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 text-xs text-destructive"
+            onClick={() => {
+              if (confirm(isEn ? `Unbind ${accountEmail}?` : `解绑 ${accountEmail}？`)) {
+                unbindAccountFromProxy(accountId)
+              }
+            }}
+          >
+            {isEn ? 'Unbind' : '解绑'}
+          </Button>
+        </div>
+      ) : (
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => setOpen(!open)}
+          className="h-7 text-xs w-full"
+        >
+          {isEn ? '+ Bind to Proxy' : '+ 绑定代理'}
+        </Button>
+      )}
+
+      {open && (
+        <div className="border rounded-lg p-2 mt-2 space-y-1 max-h-48 overflow-y-auto">
+          {aliveProxies.length === 0 ? (
+            <p className="text-[11px] text-muted-foreground p-2">
+              {isEn ? 'No alive proxies. Add and validate in "Proxy Pool".' : '无可用代理。请先在"代理池"添加并验活。'}
+            </p>
+          ) : (
+            aliveProxies.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => { bindAccountsToProxy([accountId], p.id); setOpen(false) }}
+                className={cn(
+                  'w-full flex items-center gap-2 px-2 py-1.5 rounded text-xs text-left hover:bg-muted',
+                  p.id === boundProxyId && 'bg-primary/10 text-primary'
+                )}
+              >
+                <span className="font-mono flex-1 truncate">
+                  {p.host}:{p.port}
+                  {p.label && <span className="text-muted-foreground ml-1.5">({p.label})</span>}
+                </span>
+                {p.latencyMs !== undefined && (
+                  <span className="text-[10px] text-muted-foreground">{p.latencyMs}ms</span>
+                )}
+                {p.id === boundProxyId && <span className="text-primary">✓</span>}
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
   )
 }

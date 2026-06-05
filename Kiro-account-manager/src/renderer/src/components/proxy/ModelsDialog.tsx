@@ -82,9 +82,9 @@ export function ModelsDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => onOpenChange(false)} />
-      <Card className="relative w-[850px] max-h-[85vh] shadow-2xl border overflow-hidden animate-in fade-in zoom-in-95 duration-200 bg-gradient-to-br from-background to-muted/20">
-        <CardHeader className="pb-4 border-b sticky top-0 bg-background/95 backdrop-blur z-10">
+      <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
+      <Card className="relative w-[850px] max-h-[85vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
+        <CardHeader className="pb-4 border-b sticky top-0 z-10">
           <div className="flex items-center justify-between">
             <CardTitle className="text-xl flex items-center gap-3">
               <div className="p-2 rounded-xl bg-primary/10">
@@ -97,7 +97,7 @@ export function ModelsDialog({
                     {models.length} {isEn ? 'models' : '个模型'}
                   </Badge>
                   {fromCache && (
-                    <Badge variant="secondary" className="text-xs bg-amber-500/10 text-amber-600 dark:text-amber-400 border-0">
+                    <Badge variant="secondary" className="text-xs bg-warning/10 text-warning border-0">
                       <Sparkles className="h-3 w-3 mr-1" />
                       {isEn ? 'Cached' : '缓存'}
                     </Badge>
@@ -136,7 +136,7 @@ export function ModelsDialog({
                 )}
                 <span className="ml-1.5">{isEn ? 'Refresh' : '刷新'}</span>
               </Button>
-              <Button variant="ghost" size="icon" className="h-9 w-9 rounded-lg hover:bg-destructive/10 hover:text-destructive" onClick={() => onOpenChange(false)}>
+              <Button variant="ghost" size="icon" className="h-9 w-9 rounded-lg hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
                 <X className="h-5 w-5" />
               </Button>
             </div>
@@ -145,24 +145,24 @@ export function ModelsDialog({
         <CardContent className="p-4">
           {/* IP 限制提示横幅 (Pro+ 订阅但缺失高级模型) */}
           {showIpTip && (
-            <div className="mb-3 rounded-xl border border-amber-500/30 bg-gradient-to-r from-amber-500/10 to-orange-500/10 p-3.5 relative">
+            <div className="mb-3 rounded-xl border border-warning/30 bg-gradient-to-r from-warning/10 to-warning/5 p-3.5 relative">
               <div className="flex items-start gap-3">
-                <div className="shrink-0 p-1.5 rounded-lg bg-amber-500/20">
-                  <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                <div className="shrink-0 p-1.5 rounded-lg bg-warning/20">
+                  <AlertTriangle className="h-4 w-4 text-warning" />
                 </div>
                 <div className="flex-1 min-w-0 pr-6">
-                  <p className="text-sm font-semibold text-amber-700 dark:text-amber-300 mb-1.5 flex items-center gap-1.5">
+                  <p className="text-sm font-semibold text-warning mb-1.5 flex items-center gap-1.5">
                     <Globe className="h-3.5 w-3.5" />
                     {isEn
                       ? 'Pro/Pro Max subscription but missing advanced models?'
                       : '订阅 Pro/Pro Max 但看不到高级模型？'}
                   </p>
-                  <p className="text-xs text-amber-700/90 dark:text-amber-200/90 leading-relaxed mb-1">
+                  <p className="text-xs text-warning/90 leading-relaxed mb-1">
                     {isEn
                       ? 'This is likely caused by regional restrictions on China-mainland IPs. Try the following:'
                       : '这通常是国内 IP 被限制导致的。请尝试以下方案：'}
                   </p>
-                  <ul className="text-xs text-amber-700/90 dark:text-amber-200/90 space-y-0.5 list-disc list-inside">
+                  <ul className="text-xs text-warning/90 space-y-0.5 list-disc list-inside">
                     <li>{isEn ? 'Enable VPN/proxy (system-level or app-level)' : '开启 VPN / 代理（系统级或应用级均可）'}</li>
                     <li>{isEn ? 'Switch to high-quality outbound IP (US/EU residential preferred)' : '切换到优质外网 IP（推荐美国 / 欧洲住宅 IP）'}</li>
                     <li>{isEn ? 'Click Refresh after IP change to reload models' : 'IP 切换后点击右上角「刷新」重新加载模型'}</li>
@@ -171,7 +171,7 @@ export function ModelsDialog({
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="absolute top-2 right-2 h-7 w-7 hover:bg-amber-500/20 text-amber-600 dark:text-amber-400"
+                  className="absolute top-2 right-2 h-7 w-7 hover:bg-warning/20 text-warning"
                   onClick={dismissIpTip}
                   title={isEn ? "Don't show again" : '不再显示'}
                 >
@@ -190,10 +190,10 @@ export function ModelsDialog({
               </div>
             ) : error ? (
               <div className="flex flex-col items-center justify-center py-16 text-muted-foreground">
-                <div className="p-4 rounded-full bg-red-500/10 mb-4">
-                  <X className="h-8 w-8 text-red-500" />
+                <div className="p-4 rounded-full bg-destructive/10 mb-4">
+                  <X className="h-8 w-8 text-destructive" />
                 </div>
-                <p className="text-red-500 font-medium">{error}</p>
+                <p className="text-destructive font-medium">{error}</p>
                 <p className="text-sm mt-2">{isEn ? 'Make sure proxy is running and has synced accounts' : '请确保代理服务已启动且已同步账号'}</p>
               </div>
             ) : models.length === 0 ? (
@@ -276,3 +276,5 @@ export function ModelsDialog({
     </div>
   )
 }
+
+

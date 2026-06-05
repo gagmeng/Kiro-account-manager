@@ -50,7 +50,7 @@ function toRgba(argbColor: string): string {
 }
 
 export function AccountFilterPanel(): React.ReactNode {
-  const { filter, setFilter, clearFilter, groups, tags, getStats } = useAccountsStore()
+  const { filter, setFilter, clearFilter, tags, getStats } = useAccountsStore()
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const StatusOptions = isEn ? StatusOptionsEn : StatusOptionsZh
@@ -201,35 +201,8 @@ export function AccountFilterPanel(): React.ReactNode {
             </div>
           </div>
 
-          {/* 第二行：分组 + 标签 + 范围筛选 */}
+          {/* 第二行：标签 + 范围筛选（分组改用顶部 Tab 互斥切换，不再多选筛选） */}
           <div className="flex flex-wrap items-start gap-x-6 gap-y-2 mt-2">
-            {/* 分组 */}
-            {groups.size > 0 && (
-              <div className="flex items-center gap-2">
-                <span className="text-xs text-muted-foreground shrink-0">{isEn ? 'Group:' : '分组:'}</span>
-                <div className="flex flex-wrap gap-1">
-                  {Array.from(groups.values()).map((group) => {
-                    const isActive = filter.groupIds?.includes(group.id)
-                    return (
-                      <button
-                        key={group.id}
-                        className={cn(
-                          'px-2 py-0.5 text-xs rounded border transition-colors',
-                          isActive
-                            ? 'text-white border-transparent'
-                            : 'hover:bg-muted'
-                        )}
-                        style={isActive && group.color ? { backgroundColor: toRgba(group.color) } : undefined}
-                        onClick={() => toggleArrayFilter('groupIds', group.id)}
-                      >
-                        {group.name}
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-
             {/* 标签 */}
             {tags.size > 0 && (
               <div className="flex items-center gap-2">
@@ -263,7 +236,7 @@ export function AccountFilterPanel(): React.ReactNode {
                 min="0"
                 max="100"
                 placeholder="min"
-                className="w-14 px-1.5 py-0.5 text-xs border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+                className="w-14 px-1.5 py-0.5 text-xs rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg-subtle)] backdrop-blur-md focus:outline-none focus:ring-2 focus:ring-primary/40"
                 value={filter.usageMin ?? ''}
                 onChange={(e) =>
                   setRangeFilter(
@@ -280,7 +253,7 @@ export function AccountFilterPanel(): React.ReactNode {
                 min="0"
                 max="100"
                 placeholder="max"
-                className="w-14 px-1.5 py-0.5 text-xs border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+                className="w-14 px-1.5 py-0.5 text-xs rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg-subtle)] backdrop-blur-md focus:outline-none focus:ring-2 focus:ring-primary/40"
                 value={filter.usageMax !== undefined ? filter.usageMax * 100 : ''}
                 onChange={(e) =>
                   setRangeFilter(
@@ -301,7 +274,7 @@ export function AccountFilterPanel(): React.ReactNode {
                 type="number"
                 min="0"
                 placeholder="min"
-                className="w-14 px-1.5 py-0.5 text-xs border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+                className="w-14 px-1.5 py-0.5 text-xs rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg-subtle)] backdrop-blur-md focus:outline-none focus:ring-2 focus:ring-primary/40"
                 value={filter.daysRemainingMin ?? ''}
                 onChange={(e) =>
                   setRangeFilter(
@@ -317,7 +290,7 @@ export function AccountFilterPanel(): React.ReactNode {
                 type="number"
                 min="0"
                 placeholder="max"
-                className="w-14 px-1.5 py-0.5 text-xs border rounded bg-background focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"
+                className="w-14 px-1.5 py-0.5 text-xs rounded-md border border-[var(--glass-border)] bg-[var(--glass-bg-subtle)] backdrop-blur-md focus:outline-none focus:ring-2 focus:ring-primary/40"
                 value={filter.daysRemainingMax ?? ''}
                 onChange={(e) =>
                   setRangeFilter(

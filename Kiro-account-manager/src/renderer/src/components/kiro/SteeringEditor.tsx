@@ -80,7 +80,7 @@ export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorPro
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       {/* Backdrop */}
       <div 
-        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+        className="absolute inset-0 bg-black/50"
         onClick={handleClose}
       />
       
@@ -91,7 +91,7 @@ export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorPro
           <div className="flex items-center gap-2">
             <h2 className="font-semibold">{isEn ? 'Edit Steering File' : '编辑 Steering 文件'}</h2>
             <span className="text-sm text-muted-foreground font-mono">{filename}</span>
-            {modified && <span className="text-xs text-orange-500">● {isEn ? 'Modified' : '已修改'}</span>}
+            {modified && <span className="text-xs text-warning">● {isEn ? 'Modified' : '已修改'}</span>}
           </div>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="sm" onClick={loadContent} disabled={loading}>
@@ -145,3 +145,5 @@ export function SteeringEditor({ filename, onClose, onSaved }: SteeringEditorPro
     document.body
   )
 }
+
+

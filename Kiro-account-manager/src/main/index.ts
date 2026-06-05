@@ -5,7 +5,7 @@ import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { writeFile, readFile } from 'fs/promises'
 import { encode, decode } from 'cbor-x'
-import { ProxyAgent, fetch as undiciFetch, type RequestInit as UndiciRequestInit } from 'undici'
+import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import icon from '../../resources/icon.png?asset'
 import { ProxyServer, configureProxyClients, type ProxyAccount, type ProxyConfig, type ProxyClientTarget, type ProxyClientModel } from './proxy'
 import { 
@@ -16,10 +16,20 @@ import {
   type KProxyConfig,
   type DeviceIdMapping
 } from './kproxy'
-import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB } from './proxy/kiroApi'
-import { getSystemProxy } from './proxy/systemProxy'
+import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi } from './proxy/kiroApi'
+import {
+  writeKiroAuthTokenFile,
+  readKiroAuthTokenFile,
+  parseAccessTokenClaims,
+  watchKiroAuthTokenFile,
+  resolveProfileArnForWrite,
+  KIRO_AUTH_TOKEN_PATH
+} from './kiroAuthSync'
+import { openaiToKiro } from './proxy/translator'
+import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
+import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import {
   createTray,
   destroyTray,
@@ -143,28 +153,42 @@ export function getUseKProxyForApi(): boolean {
 }
 
 // 获取网络代理 agent（优先 K-Proxy，其次用户设置代理，其次系统代理）
-function getNetworkAgent(): ProxyAgent | undefined {
+function getNetworkAgent(): Dispatcher | undefined {
   if (useKProxyForApi) {
     const kproxyService = getKProxyService()
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      const agent = safeCreateProxyAgent(proxyUrl)
+      if (agent) return agent
     }
   }
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  if (envProxy) {
-    return new ProxyAgent({ uri: envProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  const systemProxy = getSystemProxy()
-  if (systemProxy) {
-    return new ProxyAgent({ uri: systemProxy, requestTls: { rejectUnauthorized: false } })
-  }
-  return undefined
+  const envAgent = safeCreateProxyAgent(envProxy)
+  if (envAgent) return envAgent
+  return safeCreateProxyAgent(getSystemProxy())
 }
 
-// 通用 fetch 函数，使用 getNetworkAgent 获取代理
-async function fetchWithAppProxy(url: string, options: RequestInit): Promise<Response> {
+/**
+ * 通用 fetch 函数
+ * @param url 请求 URL
+ * @param options fetch 选项
+ * @param overrideProxyUrl 可选：账号绑定的代理 URL（优先级最高，覆盖全局代理逻辑）
+ *
+ * 优先级：overrideProxyUrl > K-Proxy > 用户设置代理 > 系统代理 > 直连
+ */
+async function fetchWithAppProxy(
+  url: string,
+  options: RequestInit,
+  overrideProxyUrl?: string
+): Promise<Response> {
+  // 优先尝试账号绑定代理
+  if (overrideProxyUrl) {
+    const accountAgent = safeCreateProxyAgent(overrideProxyUrl)
+    if (accountAgent) {
+      return await undiciFetch(url, { ...options, dispatcher: accountAgent } as UndiciRequestInit) as unknown as Response
+    }
+  }
   const agent = getNetworkAgent()
   if (agent) {
     return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
@@ -173,7 +197,7 @@ async function fetchWithAppProxy(url: string, options: RequestInit): Promise<Res
 }
 
 // 兼容函数，指向 getNetworkAgent
-function getKProxyAgent(): ProxyAgent | undefined {
+function getKProxyAgent(): Dispatcher | undefined {
   return getNetworkAgent()
 }
 
@@ -191,14 +215,39 @@ const KIRO_AUTH_ENDPOINT = 'https://prod.us-east-1.auth.desktop.kiro.dev'
 
 // ============ 代理设置 ============
 
+/**
+ * 规范化代理 URL，确保 protocol://host:port 格式。
+ * 容错处理用户常见的格式错误：
+ *   http:127.0.0.1:7890     → http://127.0.0.1:7890   (缺 //)
+ *   http:/127.0.0.1:7890    → http://127.0.0.1:7890   (单 /)
+ *   127.0.0.1:7890          → http://127.0.0.1:7890   (无 protocol)
+ *   http://127.0.0.1:7890   → http://127.0.0.1:7890   (已规范)
+ */
+export function normalizeProxyUrl(url: string): string {
+  const trimmed = (url || '').trim()
+  if (!trimmed) return ''
+  // 已是标准 protocol:// 前缀
+  if (/^[a-z][a-z0-9+\-.]*:\/\//i.test(trimmed)) return trimmed
+  // 有 protocol: 但缺/少 //
+  const m = trimmed.match(/^([a-z][a-z0-9+\-.]*):(\/*)(.+)$/i)
+  if (m) return `${m[1]}://${m[3]}`
+  // 无 protocol，默认 http
+  return `http://${trimmed}`
+}
+
 // 设置代理环境变量
 function applyProxySettings(enabled: boolean, url: string): void {
   if (enabled && url) {
-    process.env.HTTP_PROXY = url
-    process.env.HTTPS_PROXY = url
-    process.env.http_proxy = url
-    process.env.https_proxy = url
-    console.log(`[Proxy] Enabled: ${url}`)
+    const normalized = normalizeProxyUrl(url)
+    process.env.HTTP_PROXY = normalized
+    process.env.HTTPS_PROXY = normalized
+    process.env.http_proxy = normalized
+    process.env.https_proxy = normalized
+    if (normalized !== url) {
+      console.log(`[Proxy] Enabled: ${normalized} (规范化自: ${url})`)
+    } else {
+      console.log(`[Proxy] Enabled: ${normalized}`)
+    }
   } else {
     delete process.env.HTTP_PROXY
     delete process.env.HTTPS_PROXY
@@ -279,8 +328,9 @@ function initProxyServer(): ProxyServer {
     maxRetries: 3,
     retryDelayMs: 1000,
     tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
-    enableServerSideToolAutoContinue: false,
-    clientDrivenToolExecution: true
+    clientDrivenToolExecution: true,
+    enableTokenBufferReserve: false,
+    tokenBufferReserve: 20000
   }
   
   // 合并保存的配置和默认配置
@@ -289,6 +339,11 @@ function initProxyServer(): ProxyServer {
   // 恢复 payload 大小限制
   if (config.payloadSizeLimitKB) {
     setPayloadSizeLimitKB(config.payloadSizeLimitKB)
+  }
+  // 恢复 Token buffer reserve（开关 + 数值）
+  setEnableTokenBufferReserve(config.enableTokenBufferReserve === true)
+  if (config.tokenBufferReserve) {
+    setTokenBufferReserve(config.tokenBufferReserve)
   }
 
   proxyServer = new ProxyServer(
@@ -307,16 +362,17 @@ function initProxyServer(): ProxyServer {
       onStatusChange: (running, port) => {
         mainWindow?.webContents.send('proxy-status-change', { running, port })
       },
-      // Token 刷新回调 - 复用已有的刷新逻辑
+      // Token 刷新回调 - 复用已有的刷新逻辑，含账号绑定代理
       onTokenRefresh: async (account) => {
         try {
-          console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
+          console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}${account.proxyUrl ? ' [via bound proxy]' : ''}`)
           const refreshResult = await refreshTokenByMethod(
             account.refreshToken || '',
             account.clientId || '',
             account.clientSecret || '',
             account.region || 'us-east-1',
-            account.authMethod
+            account.authMethod,
+            account.proxyUrl  // 账号绑定的代理（如有）
           )
 
           if (refreshResult.success && refreshResult.accessToken) {
@@ -341,6 +397,37 @@ function initProxyServer(): ProxyServer {
           expiresAt: account.expiresAt
         })
       },
+      // 账号被 Kiro 后端长期封禁 - 通知渲染进程标记 lastError + 持久化到 store
+      // 不同于 token 失效，需要人工解封；账号池已自动跳过该账号
+      onAccountSuspended: (info) => {
+        console.warn(`[ProxyServer] Account suspended: ${info.email || info.accountId} (${info.reason})`)
+        // 推送 IPC 事件给前端 store
+        mainWindow?.webContents.send('proxy-account-suspended', {
+          id: info.accountId,
+          email: info.email,
+          reason: info.reason,
+          message: info.message,
+          suspendedAt: Date.now()
+        })
+        // 持久化封禁状态：依赖 renderer store 接收 IPC 后通过 saveToStorage 防抖落盘，
+        // 主进程仅在 lastSavedData 内存快照上做轻量更新，避免每次封禁都触发整库加解密 IO。
+        // 这能从根本上消除频繁封禁场景下的主进程阻塞（旧代码 store.get + store.set 各做一次 AES 全库加解密）
+        if (lastSavedData && typeof lastSavedData === 'object') {
+          try {
+            const data = lastSavedData as { accounts?: Record<string, Record<string, unknown>> }
+            if (data.accounts?.[info.accountId]) {
+              data.accounts[info.accountId] = {
+                ...data.accounts[info.accountId],
+                status: 'error',
+                lastError: `[${info.reason}] ${info.message}`,
+                lastCheckedAt: Date.now()
+              }
+            }
+          } catch (e) {
+            console.error('[ProxyServer] Failed to update suspended state in memory:', e)
+          }
+        }
+      },
       // Credits 更新回调 - 使用防抖持久化
       onCreditsUpdate: (totalCredits) => {
         debouncedStoreSet('proxyTotalCredits', totalCredits)
@@ -362,8 +449,24 @@ function initProxyServer(): ProxyServer {
       onPoolEmpty: async () => {
         await initStore()
         if (!store) return
-        const accountData = store.get('accountData') as { accounts?: Record<string, any> } | undefined
+        const accountData = store.get('accountData') as {
+          accounts?: Record<string, any>
+          accountProxyBindings?: Record<string, string>
+          proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+        } | undefined
         if (!accountData?.accounts) return
+
+        // 构建 accountId → proxyUrl 映射（用于反代时 N:1 分桶）
+        const bindings = accountData.accountProxyBindings || {}
+        const proxyPool = accountData.proxyPool || {}
+        const buildProxyUrl = (accountId: string): string | undefined => {
+          const proxyId = bindings[accountId]
+          if (!proxyId) return undefined
+          const p = proxyPool[proxyId]
+          if (!p || !p.enabled || p.status === 'dead') return undefined
+          return p.url
+        }
+
         const proxyAccounts = Object.values(accountData.accounts)
           .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
           .map((acc: any) => ({
@@ -378,16 +481,24 @@ function initProxyServer(): ProxyServer {
             clientSecret: acc.credentials?.clientSecret,
             region: acc.credentials?.region || 'us-east-1',
             authMethod: acc.credentials?.authMethod,
-            provider: acc.credentials?.provider || acc.idp
+            provider: acc.credentials?.provider || acc.idp,
+            proxyUrl: buildProxyUrl(acc.id)
           }))
         if (proxyAccounts.length > 0 && proxyServer) {
           const pool = proxyServer.getAccountPool()
           proxyAccounts.forEach(acc => pool.addAccount(acc))
-          console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store`)
+          const boundCount = proxyAccounts.filter(a => a.proxyUrl).length
+          console.log(`[ProxyServer] Lazy-synced ${proxyAccounts.length} accounts from store (${boundCount} with bound proxy)`)
         }
       }
     }
   )
+
+  // P1-6 注入 webhook 触发器：让反代关键事件（封号 / 全员配额耗尽 / 限流）能推送通知
+  proxyServer.setWebhookTrigger((event, payload) => {
+    // 通过 IPC 转发到 renderer，由 useWebhookStore.triggerEvent 实际发送
+    mainWindow?.webContents.send('proxy-webhook-trigger', { event, payload })
+  })
 
   // 恢复保存的累计 credits
   if (savedTotalCredits > 0) {
@@ -525,19 +636,20 @@ async function refreshOidcToken(
   refreshToken: string,
   clientId: string,
   clientSecret: string,
-  region: string = 'us-east-1'
+  region: string = 'us-east-1',
+  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
-  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...`)
-  
+  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...${proxyUrl ? ' [via bound proxy]' : ''}`)
+
   const url = `https://oidc.${region}.amazonaws.com/token`
-  
+
   const payload = {
     clientId,
     clientSecret,
     refreshToken,
     grantType: 'refresh_token'
   }
-  
+
   try {
     const response = await fetchWithAppProxy(url, {
       method: 'POST',
@@ -545,7 +657,7 @@ async function refreshOidcToken(
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
-    })
+    }, proxyUrl)
     
     if (!response.ok) {
       const errorText = await response.text()
@@ -569,12 +681,15 @@ async function refreshOidcToken(
 }
 
 // 社交登录 (GitHub/Google) 的 Token 刷新
-async function refreshSocialToken(refreshToken: string): Promise<OidcRefreshResult> {
-  console.log(`[Social] Refreshing token...`)
-  
+async function refreshSocialToken(
+  refreshToken: string,
+  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
+): Promise<OidcRefreshResult> {
+  console.log(`[Social] Refreshing token...${proxyUrl ? ' [via bound proxy]' : ''}`)
+
   const url = `${KIRO_AUTH_ENDPOINT}/refreshToken`
   const machineId = getCurrentMachineId()
-  
+
   try {
     const response = await fetchWithAppProxy(url, {
       method: 'POST',
@@ -583,7 +698,7 @@ async function refreshSocialToken(refreshToken: string): Promise<OidcRefreshResu
         'User-Agent': getKiroUserAgent(machineId)
       },
       body: JSON.stringify({ refreshToken })
-    })
+    }, proxyUrl)
     
     if (!response.ok) {
       const errorText = await response.text()
@@ -612,14 +727,15 @@ async function refreshTokenByMethod(
   clientId: string,
   clientSecret: string,
   region: string = 'us-east-1',
-  authMethod?: string
+  authMethod?: string,
+  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
-    return refreshSocialToken(token)
+    return refreshSocialToken(token, proxyUrl)
   }
   // 否则使用 OIDC 刷新 (IdC/BuilderId)
-  return refreshOidcToken(token, clientId, clientSecret, region)
+  return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl)
 }
 
 function generateInvocationId(): string {
@@ -1269,7 +1385,6 @@ let lastSavedData: unknown = null
 async function initStore(): Promise<void> {
   if (store) return
   const Store = (await import('electron-store')).default
-  const fs = await import('fs/promises')
   const path = await import('path')
   
   const storeInstance = new Store({
@@ -1279,16 +1394,14 @@ async function initStore(): Promise<void> {
   
   store = storeInstance as unknown as typeof store
   
-  // 尝试从备份恢复数据（如果主数据损坏）
+  // 尝试从备份恢复数据（如果主数据损坏）。备份优先读加密 .enc，兼容旧明文 .json
   try {
-    const backupPath = path.join(path.dirname(storeInstance.path), 'kiro-accounts.backup.json')
     const mainData = storeInstance.get('accountData')
-    
+
     if (!mainData) {
-      // 主数据不存在或损坏，尝试从备份恢复
       try {
-        const backupContent = await fs.readFile(backupPath, 'utf-8')
-        const backupData = JSON.parse(backupContent)
+        const { readSecureBackup } = await import('./secureBackup')
+        const backupData = await readSecureBackup(path.dirname(storeInstance.path)) as { accounts?: unknown } | null
         if (backupData && backupData.accounts) {
           console.log('[Store] Restoring data from backup...')
           storeInstance.set('accountData', backupData)
@@ -1301,25 +1414,428 @@ async function initStore(): Promise<void> {
   } catch (error) {
     console.error('[Store] Error checking backup:', error)
   }
+
+  // 一次性迁移：清理 BuilderId 占位符 profileArn 等脏数据
+  // 详见 migrateAccountDataIfNeeded 注释
+  try {
+    migrateAccountDataIfNeeded()
+  } catch (error) {
+    console.error('[Store] Account data migration failed:', error)
+  }
+
+  // 加载主动续期开关状态（默认关闭）
+  try {
+    proactiveRenewalEnabled = !!storeInstance.get('proactiveRenewalEnabled', false)
+    console.log(`[ProactiveRenewal] Loaded from settings: ${proactiveRenewalEnabled ? 'enabled' : 'disabled'}`)
+  } catch (e) {
+    console.warn('[ProactiveRenewal] Failed to load setting:', e)
+  }
 }
 
-// 创建数据备份
-async function createBackup(data: unknown): Promise<void> {
-  if (!store) return
-  
+// ============ Kiro IDE Auth Token 反向同步 ============
+//
+// Kiro IDE 桌面端自己也有 refresh loop：每 N 秒检查 token 是否快到期，到期就用磁盘里的
+// refreshToken 调 OIDC，得到新 access + 新 refresh 后写回 ~/.aws/sso/cache/kiro-auth-token.json。
+//
+// 反代如果不感知这种"IDE 自己改了 token 文件"，下次反代再调 refresh 时还在用废的旧 refresh
+// → OIDC 拒绝 → 后续 IDE 自动刷新也连环挂掉。
+//
+// 这里启动一个 fs.watchFile 监听器：
+//   - 检测到磁盘 token 变化 + 不是反代自己刚写的（lastWrittenTokenSignature 不一致）
+//   - 把新 access/refresh/expiresAt 同步回反代 store
+//   - 通过 webContents.send 通知 renderer 重新 loadAccounts，UI 立刻刷新
+//
+// 账号匹配优先级（任一命中即视为同一账号）：
+//   1) accessToken JWT 解 sub，与反代 store 里某账号 cached accessToken claims 的 sub 一致
+//   2) lastSwitchedAccountId（反代刚 switch-account 过的那一个）
+//   3) refreshToken 旧值匹配（IDE 第一次自刷新前，磁盘 refresh 还等于 store 里的）
+let stopKiroAuthTokenWatcher: (() => void) | null = null
+
+function startKiroAuthTokenWatcher(): void {
+  if (stopKiroAuthTokenWatcher) return
+  stopKiroAuthTokenWatcher = watchKiroAuthTokenFile(async (token) => {
+    const sig = `${token.accessToken}|${token.refreshToken}`
+    if (sig === lastWrittenTokenSignature) {
+      // 反代自己刚写的，跳过避免回环
+      return
+    }
+    if (sig === lastSyncedFromIdeSignature) {
+      // 之前一次 IDE 同步已处理过这份内容，跳过
+      return
+    }
+    lastSyncedFromIdeSignature = sig
+    try {
+      await syncIdeTokenChangeToStore(token)
+    } catch (e) {
+      console.warn('[KiroAuthSync] syncIdeTokenChangeToStore failed:', e)
+    }
+  })
+  console.log('[KiroAuthSync] Watching:', KIRO_AUTH_TOKEN_PATH)
+}
+
+async function syncIdeTokenChangeToStore(token: {
+  accessToken: string
+  refreshToken: string
+  expiresAt: string
+  provider?: string
+  authMethod?: string
+  region?: string
+  profileArn?: string
+}): Promise<void> {
+  if (!store) {
+    try {
+      await initStore()
+    } catch (e) {
+      console.warn('[KiroAuthSync] initStore failed, cannot sync back:', e)
+      return
+    }
+  }
+  const accountData = store?.get('accountData') as
+    | { accounts?: Record<string, { id?: string; email?: string; credentials?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }> }
+    | null
+    | undefined
+  if (!accountData?.accounts) {
+    console.log('[KiroAuthSync] No accounts in store, skip')
+    return
+  }
+
+  // 1) JWT sub 匹配（最准）
+  const newClaims = parseAccessTokenClaims(token.accessToken)
+  let matchedId: string | null = null
+  let matchedReason = ''
+  if (newClaims?.sub) {
+    for (const [id, acc] of Object.entries(accountData.accounts)) {
+      const oldClaims = acc.credentials?.accessToken
+        ? parseAccessTokenClaims(acc.credentials.accessToken)
+        : null
+      if (oldClaims?.sub && oldClaims.sub === newClaims.sub) {
+        matchedId = id
+        matchedReason = `JWT sub match (${newClaims.sub.slice(0, 12)}…)`
+        break
+      }
+    }
+  }
+
+  // 2) lastSwitchedAccountId 兜底
+  if (!matchedId && lastSwitchedAccountId && accountData.accounts[lastSwitchedAccountId]) {
+    matchedId = lastSwitchedAccountId
+    matchedReason = 'lastSwitchedAccountId fallback'
+  }
+
+  // 3) 旧 refreshToken 匹配
+  if (!matchedId) {
+    for (const [id, acc] of Object.entries(accountData.accounts)) {
+      if (acc.credentials?.accessToken === token.accessToken) {
+        // store 和 disk access 完全一致，无需同步
+        return
+      }
+      if (acc.credentials?.refreshToken && acc.credentials.refreshToken === token.refreshToken) {
+        matchedId = id
+        matchedReason = 'refreshToken exact match (no rotation yet)'
+        break
+      }
+    }
+  }
+
+  if (!matchedId) {
+    console.warn(
+      '[KiroAuthSync] IDE token file changed but no matching account in store. ' +
+        'This usually means the user signed in directly inside Kiro IDE without going through 反代切号. ' +
+        'sub=',
+      newClaims?.sub
+    )
+    return
+  }
+
+  const accountToUpdate = accountData.accounts[matchedId]
+  if (!accountToUpdate) return
+  accountToUpdate.credentials = {
+    ...accountToUpdate.credentials,
+    accessToken: token.accessToken,
+    refreshToken: token.refreshToken,
+    expiresAt: Date.parse(token.expiresAt) || Date.now() + 3600 * 1000
+  }
+
+  store!.set('accountData', accountData)
+  console.log(
+    `[KiroAuthSync] Synced IDE-refreshed token back to account ${accountToUpdate.email || matchedId} (${matchedReason})`
+  )
+
   try {
-    const fs = await import('fs/promises')
+    mainWindow?.webContents.send('kiro-ide-token-changed', {
+      accountId: matchedId,
+      reason: matchedReason
+    })
+  } catch (e) {
+    console.warn('[KiroAuthSync] failed to notify renderer:', e)
+  }
+}
+
+// ============ 主动续期实现 ============
+//
+// 设计要点：
+//  - 仅对"当前 IDE 激活账号"调度 timer（最多 1 个 in-flight timer）
+//  - schedule 之前总是 clear，确保 timer 不会泄漏（switch 到另一账号、关闭功能、登出都会 clear）
+//  - runProactiveRenewal 内部调 refreshTokenByMethod + writeKiroAuthTokenFile（复用现有逻辑）
+//  - 续期成功后自动 schedule 下一次（基于新 token 的 expiresAt）
+//  - 续期失败：不再调度，避免无限重试；让 IDE 自己的 refresh loop 兜底（双向同步仍生效）
+//  - 通过 webContents.send('kiro-ide-token-changed') 通知 renderer 重新加载，UI 立刻刷新
+
+function clearProactiveRenewal(reason?: string): void {
+  if (proactiveRenewalTimer) {
+    clearTimeout(proactiveRenewalTimer)
+    proactiveRenewalTimer = null
+    if (reason) console.log(`[ProactiveRenewal] Timer cleared: ${reason}`)
+  }
+}
+
+/**
+ * 在 token 剩余 (PROACTIVE_RENEWAL_LEAD_MS) 时触发续期。
+ * 调用者负责传入准确的 expiresAt（来自 OIDC 真实 expiresIn），不读 store 避免不一致。
+ */
+function scheduleProactiveRenewal(accountId: string, expiresAtMs: number): void {
+  clearProactiveRenewal()
+  if (!proactiveRenewalEnabled) return
+  const msUntilRenewal = expiresAtMs - Date.now() - PROACTIVE_RENEWAL_LEAD_MS
+  // 若已经在窗口内（包括已过期），立刻续期
+  const delay = Math.max(msUntilRenewal, 0)
+  console.log(
+    `[ProactiveRenewal] Scheduled in ${Math.round(delay / 1000)}s for account ${accountId} ` +
+      `(token expiresAt ${new Date(expiresAtMs).toISOString()})`
+  )
+  proactiveRenewalTimer = setTimeout(() => {
+    proactiveRenewalTimer = null
+    void runProactiveRenewal(accountId)
+  }, delay)
+}
+
+async function runProactiveRenewal(accountId: string): Promise<void> {
+  if (!proactiveRenewalEnabled) {
+    console.log('[ProactiveRenewal] Disabled, skip run')
+    return
+  }
+  if (!store) {
+    try {
+      await initStore()
+    } catch (e) {
+      console.warn('[ProactiveRenewal] initStore failed:', e)
+      return
+    }
+  }
+  const accountData = store?.get('accountData') as
+    | { accounts?: Record<string, { id?: string; email?: string; profileArn?: string; proxyUrl?: string; credentials?: { refreshToken?: string; clientId?: string; clientSecret?: string; region?: string; authMethod?: string; startUrl?: string; provider?: string; accessToken?: string; expiresAt?: number } }> }
+    | null
+    | undefined
+  const account = accountData?.accounts?.[accountId]
+  if (!account) {
+    console.log(`[ProactiveRenewal] Account ${accountId} no longer exists, stop`)
+    return
+  }
+  const creds = account.credentials
+  if (!creds?.refreshToken) {
+    console.log(`[ProactiveRenewal] Account ${accountId} has no refreshToken, stop`)
+    return
+  }
+  console.log(
+    `[ProactiveRenewal] Renewing token for IDE active account ${account.email || accountId}...`
+  )
+  let refreshResult
+  try {
+    refreshResult = await refreshTokenByMethod(
+      creds.refreshToken,
+      creds.clientId || '',
+      creds.clientSecret || '',
+      creds.region || 'us-east-1',
+      creds.authMethod,
+      account.proxyUrl
+    )
+  } catch (e) {
+    console.warn('[ProactiveRenewal] refreshTokenByMethod threw, stop scheduling:', e)
+    return
+  }
+  if (!refreshResult.success || !refreshResult.accessToken) {
+    console.warn(
+      `[ProactiveRenewal] Renewal failed: ${refreshResult.error || 'unknown'}. ` +
+        `Stop scheduling; IDE's own refresh loop will take over as fallback.`
+    )
+    return
+  }
+  const newAccess = refreshResult.accessToken
+  const newRefresh = refreshResult.refreshToken || creds.refreshToken
+  const expiresIn = refreshResult.expiresIn ?? 3600
+  const newExpiresAt = Date.now() + expiresIn * 1000
+
+  const resolvedProfileArn = resolveProfileArnForWrite({
+    profileArn: account.profileArn,
+    authMethod: creds.authMethod,
+    provider: creds.provider
+  })
+
+  // 1. 写磁盘（同步给 IDE）
+  try {
+    await writeKiroAuthTokenFile({
+      accessToken: newAccess,
+      refreshToken: newRefresh,
+      expiresAtIso: new Date(newExpiresAt).toISOString(),
+      authMethod: (creds.authMethod === 'social' ? 'social' : 'IdC'),
+      provider: creds.provider || 'BuilderId',
+      region: creds.region,
+      startUrl: creds.startUrl,
+      clientId: creds.clientId || undefined,
+      clientSecret: creds.clientSecret || undefined,
+      profileArn: resolvedProfileArn
+    })
+    lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
+    lastSwitchedAccountId = accountId
+  } catch (e) {
+    console.warn('[ProactiveRenewal] Failed to write IDE token file (will still try store sync):', e)
+  }
+
+  // 2. 写 store（同步反代/UI）
+  if (store) {
+    account.credentials = {
+      ...creds,
+      accessToken: newAccess,
+      refreshToken: newRefresh,
+      expiresAt: newExpiresAt
+    }
+    store.set('accountData', accountData)
+  }
+
+  // 3. 通知 renderer reload
+  try {
+    mainWindow?.webContents.send('kiro-ide-token-changed', {
+      accountId,
+      reason: 'proactive-renewal'
+    })
+  } catch {
+    /* renderer 可能已关闭 */
+  }
+
+  console.log(
+    `[ProactiveRenewal] Renewed OK for ${account.email || accountId}. ` +
+      `Next renewal in ${expiresIn - PROACTIVE_RENEWAL_LEAD_MS / 1000}s`
+  )
+
+  // 4. 调度下一次
+  scheduleProactiveRenewal(accountId, newExpiresAt)
+}
+
+/**
+ * 账号数据迁移（已停用）：曾用于清理 profileArn 占位符，
+ * 但 Kiro IDE 内部逻辑依赖该字段存在，移除后导致严重问题，已回退。
+ * 保留函数壳和标记写入，防止旧版本回滚时重复执行。
+ */
+function migrateAccountDataIfNeeded(): void {
+  if (!store) return
+  const MIGRATION_KEY = 'accountDataMigration'
+  const FLAG = 'builderIdArn'
+  const migrationState = (store.get(MIGRATION_KEY, {}) as Record<string, number>) || {}
+  const accountData = store.get('accountData') as
+    | { accounts?: Record<string, { id?: string; provider?: string; profileArn?: string; email?: string }> }
+    | null
+    | undefined
+
+  if (!accountData?.accounts) {
+    if (!migrationState[FLAG]) {
+      store.set(MIGRATION_KEY, { ...migrationState, [FLAG]: 1 })
+    }
+    return
+  }
+
+  // profileArn 占位符不再清理 —— Kiro IDE 内部逻辑依赖该字段存在
+  // 保留迁移标记写入以避免旧版本回滚时重复执行
+
+  if (!migrationState[FLAG]) {
+    store.set(MIGRATION_KEY, { ...migrationState, [FLAG]: 1 })
+  }
+}
+
+// ============ 备份节流配置 ============
+// 备份是为容灾兜底，不需要每次保存都全量重写文件，按时间节流即可大幅降低磁盘 IO。
+const BACKUP_THROTTLE_MS = 5 * 60 * 1000 // 5 分钟最多写一次备份
+let lastBackupTime = 0
+let pendingBackupData: unknown = null
+let pendingBackupTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * 创建数据备份（节流）
+ * - 距上次备份不足 BACKUP_THROTTLE_MS 时，仅记录数据指针，不立即写盘
+ * - 节流窗口结束后，自动 flush 最新一份数据
+ * - 退出前可手动调用 flushBackupNow() 强制写盘
+ */
+async function createBackup(data: unknown): Promise<void> {
+  pendingBackupData = data
+  const now = Date.now()
+  const elapsed = now - lastBackupTime
+
+  if (elapsed >= BACKUP_THROTTLE_MS) {
+    // 节流窗口已过，立即写盘
+    await writeBackupNow()
+    return
+  }
+
+  // 在节流窗口内：调度一次延迟 flush（如果尚未调度）
+  if (!pendingBackupTimer) {
+    const delay = BACKUP_THROTTLE_MS - elapsed
+    pendingBackupTimer = setTimeout(() => {
+      pendingBackupTimer = null
+      void writeBackupNow()
+    }, delay)
+  }
+}
+
+/**
+ * 真正执行备份写盘。仅当 pendingBackupData 非空时写入。
+ */
+async function writeBackupNow(): Promise<void> {
+  if (!store || pendingBackupData == null) return
+  const data = pendingBackupData
+  pendingBackupData = null
+  lastBackupTime = Date.now()
+  try {
     const path = await import('path')
-    const backupPath = path.join(path.dirname(store.path), 'kiro-accounts.backup.json')
-    
-    await fs.writeFile(backupPath, JSON.stringify(data, null, 2), 'utf-8')
-    console.log('[Backup] Data backup created')
+    const { writeSecureBackup, isSecureBackupAvailable } = await import('./secureBackup')
+    await writeSecureBackup(path.dirname(store.path), data)
+    console.log(`[Backup] Data backup created (${isSecureBackupAvailable() ? 'encrypted' : 'plaintext-fallback'})`)
   } catch (error) {
     console.error('[Backup] Failed to create backup:', error)
   }
 }
 
+/**
+ * 强制 flush 待写的备份（用于退出前兜底）
+ */
+async function flushBackupNow(): Promise<void> {
+  if (pendingBackupTimer) {
+    clearTimeout(pendingBackupTimer)
+    pendingBackupTimer = null
+  }
+  if (pendingBackupData != null) {
+    await writeBackupNow()
+  }
+}
+
 let mainWindow: BrowserWindow | null = null
+
+// ============ Kiro IDE Auth 同步状态 ============
+// 账号管理器上一次写入 kiro-auth-token.json 时对应的 accountId，watcher 反向同步时优先用它
+let lastSwitchedAccountId: string | null = null
+// 账号管理器上一次写入时的 token 签名（access|refresh）。
+// watcher 触发时若签名一致，说明是账号管理器自己写的，跳过反向同步，避免回环。
+let lastWrittenTokenSignature: string | null = null
+// 上一次反向同步成功时刷写过的 store 数据签名，用于 dedupe webContents.send
+let lastSyncedFromIdeSignature: string | null = null
+
+// ============ 主动续期（Proactive Token Renewal） ============
+// 思路：在 Kiro IDE 内部 refresh loop 触发之前（token 剩 10 分钟时）抢先 refresh，
+//   让 IDE 永远拿到剩余时间充足的 token，IDE 自己永远不需要调 OIDC → 彻底消除 race。
+// 仅对"当前 IDE 激活账号"（lastSwitchedAccountId）维护一个 timer，开销小。
+// 默认关闭，需用户在 Settings 中显式打开。
+let proactiveRenewalEnabled = false
+let proactiveRenewalTimer: NodeJS.Timeout | null = null
+// 在 token 剩余多久时触发主动续期。15 分钟 > Kiro IDE 的 10 分钟阈值，确保抢先。
+const PROACTIVE_RENEWAL_LEAD_MS = 15 * 60 * 1000
 
 // ============ 托盘相关变量 ============
 let traySettings: TraySettings = { ...defaultTraySettings }
@@ -1472,15 +1988,21 @@ function initTray(): void {
 
 function createWindow(): void {
   // Create the browser window.
+  const isMac = process.platform === 'darwin'
   mainWindow = new BrowserWindow({
     title: `Kiro 账号管理器 v${app.getVersion()}`,
     width: 1200,   // 刚好容纳 3 列卡片 (340*3 + 16*2 + 边距)
-    height: 1100,
+    height: 1200,
     minWidth: 800,
     minHeight: 600,
     show: false,
     autoHideMenuBar: true,
     icon,
+    // 自定义 titlebar：mac 保留红绿黄灯 + 隐藏标题栏；win/linux 完全无 frame
+    frame: isMac,
+    titleBarStyle: isMac ? 'hiddenInset' : 'default',
+    trafficLightPosition: isMac ? { x: 14, y: 12 } : undefined,
+    // 不透明窗口（关闭透明 + Mica/Vibrancy 避免桌面元素干扰）
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -1488,6 +2010,10 @@ function createWindow(): void {
       nodeIntegration: false
     }
   })
+
+  // ============ 自定义 titlebar IPC ============
+  mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximize-changed', true))
+  mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximize-changed', false))
 
   mainWindow.on('ready-to-show', () => {
     // 设置带版本号的标题（HTML 加载后会覆盖初始标题）
@@ -1509,8 +2035,23 @@ function createWindow(): void {
         
         // 自启动时同步账号到代理池（含重试机制应对冷启动数据延迟）
         const syncAccountsToPool = (): number => {
-          const accountData = store!.get('accountData') as { accounts?: Record<string, any> } | undefined
+          const accountData = store!.get('accountData') as {
+            accounts?: Record<string, any>
+            accountProxyBindings?: Record<string, string>
+            proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+          } | undefined
           if (!accountData?.accounts) return 0
+
+          const bindings = accountData.accountProxyBindings || {}
+          const proxyPool = accountData.proxyPool || {}
+          const buildProxyUrl = (accountId: string): string | undefined => {
+            const proxyId = bindings[accountId]
+            if (!proxyId) return undefined
+            const p = proxyPool[proxyId]
+            if (!p || !p.enabled || p.status === 'dead') return undefined
+            return p.url
+          }
+
           const proxyAccounts = Object.values(accountData.accounts)
             .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
             .map((acc: any) => ({
@@ -1525,7 +2066,8 @@ function createWindow(): void {
               clientSecret: acc.credentials?.clientSecret,
               region: acc.credentials?.region || 'us-east-1',
               authMethod: acc.credentials?.authMethod,
-              provider: acc.credentials?.provider || acc.idp
+              provider: acc.credentials?.provider || acc.idp,
+              proxyUrl: buildProxyUrl(acc.id)
             }))
           if (proxyAccounts.length > 0) {
             const pool = server.getAccountPool()
@@ -1715,6 +2257,10 @@ app.whenReady().then(async () => {
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
 
+  // 启动 Kiro IDE token 文件监听（反向同步：IDE 自己 refresh 后把新 token 同步回反代 store）
+  // 见 syncIdeTokenChangeToStore 注释
+  startKiroAuthTokenWatcher()
+
   // 注册自定义协议
   registerProtocol()
 
@@ -1761,6 +2307,17 @@ app.whenReady().then(async () => {
   ipcMain.handle('get-tray-settings', () => {
     return traySettings
   })
+
+  // ============ 自定义 titlebar IPC ============
+  ipcMain.on('window-minimize', () => mainWindow?.minimize())
+  ipcMain.on('window-maximize-toggle', () => {
+    if (!mainWindow) return
+    if (mainWindow.isMaximized()) mainWindow.unmaximize()
+    else mainWindow.maximize()
+  })
+  ipcMain.on('window-close', () => mainWindow?.close())
+  ipcMain.handle('window-is-maximized', () => !!mainWindow?.isMaximized())
+  ipcMain.handle('window-get-platform', () => process.platform)
 
   // IPC: 获取显示主窗口快捷键
   ipcMain.handle('get-show-window-shortcut', () => {
@@ -1978,6 +2535,233 @@ app.whenReady().then(async () => {
     }
   })
 
+  // ============ 一键诊断 ============
+  /**
+   * 测试一组目标 URL 的连通性（用于诊断面板）
+   * 支持指定代理 URL；返回每个目标的延迟与错误
+   */
+  ipcMain.handle('diagnose:run', async (_event, params: {
+    proxyUrl?: string
+    targets: Array<{ id: string; label: string; url: string; timeoutMs?: number; expectStatus?: number[] }>
+  }) => {
+    const { proxyUrl, targets } = params || {}
+    const agent = proxyUrl ? safeCreateProxyAgent(proxyUrl) : undefined
+
+    const results = await Promise.all((targets || []).map(async (t) => {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), t.timeoutMs ?? 8000)
+      const start = Date.now()
+      try {
+        const init: UndiciRequestInit = {
+          method: 'GET',
+          signal: controller.signal,
+          headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
+        }
+        if (agent) init.dispatcher = agent
+        const resp = await undiciFetch(t.url, init)
+        const latencyMs = Date.now() - start
+        const expected = t.expectStatus
+        const ok = expected ? expected.includes(resp.status) : (resp.status >= 200 && resp.status < 400)
+        return {
+          id: t.id,
+          label: t.label,
+          url: t.url,
+          success: ok,
+          httpStatus: resp.status,
+          latencyMs,
+          error: ok ? undefined : `HTTP ${resp.status}`
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        return {
+          id: t.id,
+          label: t.label,
+          url: t.url,
+          success: false,
+          latencyMs: Date.now() - start,
+          error: controller.signal.aborted ? '超时' : errMsg
+        }
+      } finally {
+        clearTimeout(timer)
+      }
+    }))
+
+    return { results }
+  })
+
+  // ============ 代理池验活 ============
+  /**
+   * 通过指定代理 URL 请求测试地址，返回延迟与出口 IP
+   * 仅支持 http/https 协议代理（受 undici ProxyAgent 限制；socks 协议会被 safeCreateProxyAgent 静默跳过）
+   */
+  // 代理池相关 IPC handler 已拆分到独立模块，便于后续维护
+  registerProxyPoolIpcHandlers()
+
+  // ============ 账号-代理绑定（反代时 N 账号一个 IP）============
+  /**
+   * 设置账号在反代场景下使用的出口代理 URL
+   * 同时更新：反代账号池里现存的 ProxyAccount.proxyUrl + store 持久化的 accountProxyBindings
+   */
+  ipcMain.handle('account-set-proxy-binding', async (_event, accountId: string, proxyUrl: string | undefined) => {
+    try {
+      if (!accountId) return { success: false }
+      // 更新反代账号池内存中的 proxyUrl
+      if (proxyServer) {
+        const pool = proxyServer.getAccountPool()
+        const acc = pool.getAccount(accountId)
+        if (acc) {
+          acc.proxyUrl = proxyUrl || undefined
+          console.log(`[ProxyServer] Account ${acc.email || accountId.slice(0, 8)} proxy ${proxyUrl ? `bound to ${proxyUrl.replace(/:([^:@/]+)@/, ':***@')}` : 'unbound'}`)
+        }
+      }
+      return { success: true }
+    } catch (err) {
+      console.error('[account-set-proxy-binding] error:', err)
+      return { success: false }
+    }
+  })
+
+  // ============ 通用 HTTP 诊断探测 ============
+  /**
+   * 使用应用代理设置发起一次 GET/HEAD 请求，返回延迟、状态码、错误信息。
+   * 用于"一键诊断"面板中检测 Kiro API / 邮箱服务 / 公网连通性。
+   */
+  ipcMain.handle('diagnose:http-probe', async (_event, params: {
+    url: string
+    method?: 'GET' | 'HEAD'
+    timeoutMs?: number
+  }) => {
+    const { url, method = 'GET', timeoutMs = 5000 } = params || {}
+    if (!url) return { success: false, error: 'Missing url' }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const start = Date.now()
+    try {
+      const resp = await fetchWithAppProxy(url, {
+        method,
+        signal: controller.signal,
+        headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
+      })
+      const latencyMs = Date.now() - start
+      return { success: resp.ok, latencyMs, status: resp.status }
+    } catch (err) {
+      const isAbort = controller.signal.aborted
+      return {
+        success: false,
+        latencyMs: Date.now() - start,
+        error: isAbort ? `Timeout (${timeoutMs}ms)` : (err instanceof Error ? err.message : String(err))
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
+  // IPC: 账号测活 —— 指定账号走反代逻辑（callKiroApi，与反代服务器同一底层调用）
+  // 给指定模型发一条测试消息，验证账号是否能正常返回，用于一键诊断"账号测活"功能
+  ipcMain.handle('diagnose:account-liveness', async (_event, params: {
+    account: {
+      id?: string
+      email?: string
+      accessToken?: string
+      refreshToken?: string
+      clientId?: string
+      clientSecret?: string
+      region?: string
+      authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
+      provider?: string
+      profileArn?: string
+      machineId?: string
+      expiresAt?: number
+      proxyUrl?: string
+    }
+    model?: string
+    message?: string
+    timeoutMs?: number
+  }) => {
+    const acc = params?.account
+    const model = (params?.model || 'claude-sonnet-4.5').trim()
+    const message = (params?.message || 'Hi, reply with "pong" only.').trim()
+    const timeoutMs = params?.timeoutMs ?? 45000
+    const start = Date.now()
+
+    if (!acc || !acc.accessToken) {
+      return { success: false, error: '账号缺少 accessToken', latencyMs: 0 }
+    }
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    try {
+      // 1) Token 即将过期/已过期 → 先刷新（走账号绑定代理）
+      let accessToken = acc.accessToken
+      const needsRefresh = acc.expiresAt ? (acc.expiresAt - Date.now() < 60_000) : false
+      if (needsRefresh && acc.refreshToken) {
+        try {
+          const r = await refreshTokenByMethod(
+            acc.refreshToken,
+            acc.clientId || '',
+            acc.clientSecret || '',
+            acc.region || 'us-east-1',
+            acc.authMethod,
+            acc.proxyUrl
+          )
+          if (r.success && r.accessToken) accessToken = r.accessToken
+        } catch { /* 刷新失败则用原 token 尝试，让真实错误暴露出来 */ }
+      }
+
+      // 2) 构建 ProxyAccount（callKiroApi 需要的账号结构）
+      const proxyAccount: ProxyAccount = {
+        id: acc.id || 'diagnose',
+        email: acc.email,
+        accessToken,
+        refreshToken: acc.refreshToken,
+        clientId: acc.clientId,
+        clientSecret: acc.clientSecret,
+        region: acc.region || 'us-east-1',
+        authMethod: acc.authMethod,
+        provider: acc.provider,
+        profileArn: acc.profileArn,
+        machineId: acc.machineId,
+        proxyUrl: acc.proxyUrl,
+        expiresAt: acc.expiresAt
+      }
+
+      // 3) 构建最小 OpenAI chat 请求 → 转 Kiro payload
+      const payload = openaiToKiro({
+        model,
+        messages: [{ role: 'user', content: message }],
+        stream: false,
+        max_tokens: 64
+      }, proxyAccount.profileArn)
+
+      // 4) 调用（与反代服务器内部完全相同的底层调用）
+      const result = await callKiroApi(proxyAccount, payload, controller.signal)
+      const latencyMs = Date.now() - start
+      const content = (result.content || '').trim()
+      return {
+        success: true,
+        latencyMs,
+        model,
+        content: content.slice(0, 500),
+        usage: {
+          inputTokens: result.usage?.inputTokens || 0,
+          outputTokens: result.usage?.outputTokens || 0,
+          credits: result.usage?.credits || 0
+        }
+      }
+    } catch (err) {
+      const isAbort = controller.signal.aborted
+      const rawMsg = err instanceof Error ? err.message : String(err)
+      return {
+        success: false,
+        latencyMs: Date.now() - start,
+        model,
+        error: isAbort ? `超时 (${timeoutMs}ms)` : rawMsg
+      }
+    } finally {
+      clearTimeout(timer)
+    }
+  })
+
   // IPC: 加载账号数据
   ipcMain.handle('load-accounts', async () => {
     try {
@@ -2009,7 +2793,7 @@ app.whenReady().then(async () => {
   // IPC: 刷新账号 Token（支持 IdC 和社交登录）
   ipcMain.handle('refresh-account-token', async (_event, account) => {
     try {
-      const { refreshToken, clientId, clientSecret, region, authMethod } = account.credentials || {}
+      const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider } = account.credentials || {}
 
       if (!refreshToken) {
         return { success: false, error: { message: '缺少 Refresh Token' } }
@@ -2020,33 +2804,151 @@ app.whenReady().then(async () => {
         return { success: false, error: { message: '缺少 OIDC 刷新凭证 (clientId/clientSecret)' } }
       }
 
-      console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
+      // 查找账号绑定的代理 URL（账号池中已有 proxyUrl 字段）
+      const boundProxyUrl = proxyServer
+        ? (proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl)
+        : undefined
 
-      // 根据 authMethod 选择刷新方式
+      console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
+
+      // 根据 authMethod 选择刷新方式（透传账号绑定代理）
       const refreshResult = await refreshTokenByMethod(
         refreshToken,
         clientId || '',
         clientSecret || '',
         region || 'us-east-1',
-        authMethod
+        authMethod,
+        boundProxyUrl
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
         return { success: false, error: { message: refreshResult.error || 'Token 刷新失败' } }
       }
 
+      const newAccess = refreshResult.accessToken
+      const newRefresh = refreshResult.refreshToken || refreshToken
+      const expiresIn = refreshResult.expiresIn ?? 3600
+
+      // bug B 修复：仅当该账号是 Kiro IDE 当前激活账号时，同步写入磁盘 token 文件
+      // 判定优先级（任一命中即视为"是当前激活账号"）：
+      //   1) 磁盘 token 的 refreshToken === renderer 传入的 account.credentials.refreshToken（最准）
+      //   2) account.id === lastSwitchedAccountId（反代刚切过号的兜底）
+      // 不同步的场景：用户在反代里刷新的是"非当前激活账号"，避免误覆盖 IDE 当前账号
+      let syncedToIde = false
+      let syncSkipReason: string | undefined
+      try {
+        const diskToken = await readKiroAuthTokenFile()
+        const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
+        const matchByLastSwitch = !!account.id && lastSwitchedAccountId === account.id
+        if (matchByRefresh || matchByLastSwitch) {
+          const resolvedProfileArn = resolveProfileArnForWrite({
+            profileArn: account.profileArn,
+            authMethod,
+            provider
+          })
+          await writeKiroAuthTokenFile({
+            accessToken: newAccess,
+            refreshToken: newRefresh,
+            expiresAtIso: new Date(Date.now() + expiresIn * 1000).toISOString(),
+            authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
+            provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
+            region: region || diskToken?.region,
+            startUrl,
+            clientId: clientId || undefined,
+            clientSecret: clientSecret || undefined,
+            profileArn: resolvedProfileArn
+          })
+          // 记录刚写入的签名，避免 watcher 触发反向同步回环
+          lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
+          if (account.id) lastSwitchedAccountId = account.id
+          syncedToIde = true
+          console.log(`[Refresh] Synced refreshed token to Kiro IDE for account ${account.email || account.id}`)
+          // 重新 schedule 主动续期 timer（基于新 expiresAt，覆盖任何旧 timer）
+          if (proactiveRenewalEnabled && account.id) {
+            scheduleProactiveRenewal(account.id, Date.now() + expiresIn * 1000)
+          }
+        } else {
+          syncSkipReason = diskToken
+            ? '该账号不是 Kiro IDE 当前激活账号，跳过磁盘同步'
+            : '磁盘上未找到 kiro-auth-token.json（IDE 未登录），跳过磁盘同步'
+        }
+      } catch (e) {
+        syncSkipReason = `磁盘同步异常：${e instanceof Error ? e.message : String(e)}`
+        console.warn('[Refresh] Failed to sync token to IDE:', e)
+      }
+
       return {
         success: true,
         data: {
-          accessToken: refreshResult.accessToken,
-          refreshToken: refreshResult.refreshToken || refreshToken,
-          expiresIn: refreshResult.expiresIn ?? 3600
+          accessToken: newAccess,
+          refreshToken: newRefresh,
+          expiresIn,
+          // 让 renderer 决定是否给用户显示"已同步到 IDE"的反馈
+          syncedToIde,
+          syncSkipReason
         }
       }
     } catch (error) {
       return {
         success: false,
         error: { message: error instanceof Error ? error.message : 'Unknown error' }
+      }
+    }
+  })
+
+  // ============ 主动续期开关 IPC ============
+  // 启用后，账号管理器会在 IDE 当前激活账号的 token 剩 PROACTIVE_RENEWAL_LEAD_MS（默认 15 分钟）时
+  // 抢先 refresh + 写磁盘，IDE 永远拿到剩余 ≥ 45 分钟的 token，IDE 内部 refresh loop 不会触发，
+  // 彻底消除 IDE 与账号管理器同时 refresh 撞车的可能。
+  ipcMain.handle('set-proactive-renewal-enabled', async (_event, enabled: boolean) => {
+    try {
+      await initStore()
+      proactiveRenewalEnabled = !!enabled
+      store?.set('proactiveRenewalEnabled', proactiveRenewalEnabled)
+      console.log(`[ProactiveRenewal] ${proactiveRenewalEnabled ? 'Enabled' : 'Disabled'} by user`)
+
+      if (proactiveRenewalEnabled) {
+        // 启用时：若当前已有 IDE 激活账号，立刻 schedule
+        if (lastSwitchedAccountId) {
+          const accountData = store?.get('accountData') as
+            | { accounts?: Record<string, { credentials?: { expiresAt?: number } }> }
+            | null
+            | undefined
+          const acc = accountData?.accounts?.[lastSwitchedAccountId]
+          const exp = acc?.credentials?.expiresAt
+          if (typeof exp === 'number' && exp > Date.now()) {
+            scheduleProactiveRenewal(lastSwitchedAccountId, exp)
+          } else {
+            console.log('[ProactiveRenewal] No valid expiresAt for current IDE active account, will schedule after next switch/refresh')
+          }
+        } else {
+          console.log('[ProactiveRenewal] No IDE active account recorded yet, will schedule after next switch')
+        }
+      } else {
+        clearProactiveRenewal('disabled by user')
+      }
+      return { success: true, enabled: proactiveRenewalEnabled }
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      }
+    }
+  })
+
+  ipcMain.handle('get-proactive-renewal-enabled', async () => {
+    try {
+      await initStore()
+      return {
+        success: true,
+        enabled: !!store?.get('proactiveRenewalEnabled', false),
+        leadTimeMinutes: PROACTIVE_RENEWAL_LEAD_MS / 60000
+      }
+    } catch (error) {
+      return {
+        success: false,
+        enabled: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
       }
     }
   })
@@ -2396,7 +3298,12 @@ app.whenReady().then(async () => {
 
     try {
       const { accessToken, refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
-      
+
+      // 查询账号绑定的代理（账号池）
+      const boundProxyUrl = proxyServer
+        ? proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl
+        : undefined
+
       // 确定正确的 idp：优先使用 credentials.provider，否则回退到 account.idp
       // 社交登录使用实际的 provider (Github/Google)，IdC 使用 BuilderId
       let idp = 'BuilderId'
@@ -2444,15 +3351,16 @@ app.whenReady().then(async () => {
         // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
         const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
         if (errorMsg.includes('401') && canRefresh) {
-          console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...`)
-          
-          // 尝试刷新 token - 根据 authMethod 选择刷新方式
+          console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
+
+          // 尝试刷新 token - 根据 authMethod 选择刷新方式（透传账号代理）
           const refreshResult = await refreshTokenByMethod(
             refreshToken,
             clientId || '',
             clientSecret || '',
             region || 'us-east-1',
-            authMethod
+            authMethod,
+            boundProxyUrl
           )
           
           if (refreshResult.success && refreshResult.accessToken) {
@@ -2527,7 +3435,12 @@ app.whenReady().then(async () => {
           try {
             const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
             const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
-            
+
+            // 查询账号绑定的代理（从主进程账号池）
+            const boundProxyUrl = proxyServer
+              ? proxyServer.getAccountPool().getAccount(account.id)?.proxyUrl
+              : undefined
+
             // 确定正确的 idp
             let idp = 'BuilderId'
             if (authMethod === 'social') {
@@ -2548,13 +3461,14 @@ app.whenReady().then(async () => {
                 return
               }
 
-              // 刷新 Token
+              // 刷新 Token（透传账号绑定代理）
               const refreshResult = await refreshTokenByMethod(
                 refreshToken,
                 clientId || '',
                 clientSecret || '',
                 region || 'us-east-1',
-                authMethod
+                authMethod,
+                boundProxyUrl
               )
 
               if (!refreshResult.success) {
@@ -2572,6 +3486,45 @@ app.whenReady().then(async () => {
               newAccessToken = refreshResult.accessToken || accessToken
               newRefreshToken = refreshResult.refreshToken || refreshToken
               newExpiresIn = refreshResult.expiresIn
+
+              // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
+              // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。
+              // 判定优先级（任一命中）：1) 磁盘 refresh 匹配账号  2) lastSwitchedAccountId 匹配
+              if (newAccessToken && newRefreshToken && newExpiresIn) {
+                try {
+                  const diskToken = await readKiroAuthTokenFile()
+                  const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
+                  const matchByLastSwitch = lastSwitchedAccountId === account.id
+                  if (matchByRefresh || matchByLastSwitch) {
+                    const resolvedProfileArn = resolveProfileArnForWrite({
+                      profileArn: diskToken?.profileArn,
+                      authMethod,
+                      provider
+                    })
+                    await writeKiroAuthTokenFile({
+                      accessToken: newAccessToken,
+                      refreshToken: newRefreshToken,
+                      expiresAtIso: new Date(Date.now() + newExpiresIn * 1000).toISOString(),
+                      authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
+                      provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
+                      region: region || diskToken?.region,
+                      // background-batch-refresh 没传 startUrl，但 disk 的 clientIdHash 不再变；
+                      // helper 会用默认 startUrl 计算同一 hash，写入的 client 注册文件路径也不会变
+                      clientId: clientId || undefined,
+                      clientSecret: clientSecret || undefined,
+                      profileArn: resolvedProfileArn
+                    })
+                    lastWrittenTokenSignature = `${newAccessToken}|${newRefreshToken}`
+                    if (account.id) lastSwitchedAccountId = account.id
+                    console.log(`[BackgroundRefresh] Synced refreshed token to Kiro IDE for account ${account.id}`)
+                    if (proactiveRenewalEnabled && account.id) {
+                      scheduleProactiveRenewal(account.id, Date.now() + newExpiresIn * 1000)
+                    }
+                  }
+                } catch (e) {
+                  console.warn(`[BackgroundRefresh] sync to IDE failed for ${account.id}:`, e)
+                }
+              }
             }
 
             // 获取账号信息
@@ -3526,6 +4479,15 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 切换账号 - 写入凭证到本地 SSO 缓存
+  //
+  // 关键设计：切号前必先 refresh 一次，但与旧实现不同——
+  //   1. (bug A 修复) 把 OIDC 返回的新 refreshToken 也写入磁盘
+  //      （旧实现只更新 accessToken，refreshToken 仍是已被服务端 rotate 作废的 v1，
+  //       导致 Kiro IDE ~55min 后用 v1 刷新 → 401 → logoutAndForget）
+  //   2. (bug C 修复) expiresAt 用 OIDC 返回的真实 expiresIn，不再硬编码 3600
+  //   3. (bug D 修复) refresh 失败时直接报错并拒绝写入文件，避免埋雷
+  //   4. (bug F 支持) 通过 refreshedCredentials 把新 refresh 回传 renderer，让反代 store 同步
+  //   5. 记录 lastSwitchedAccountId，供 fs.watch 反向同步时用作账号匹配兜底
   ipcMain.handle('switch-account', async (_event, credentials: {
     accessToken: string
     refreshToken: string
@@ -3536,102 +4498,92 @@ app.whenReady().then(async () => {
     authMethod?: 'IdC' | 'social'
     provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
     profileArn?: string
+    accountId?: string
   }) => {
-    const os = await import('os')
-    const path = await import('path')
-    const crypto = await import('crypto')
-    const { mkdir, writeFile } = await import('fs/promises')
-    
     try {
-      const { 
-        refreshToken, 
-        clientId, 
-        clientSecret, 
+      const {
+        refreshToken,
+        clientId,
+        clientSecret,
         region = 'us-east-1',
         startUrl,
         authMethod = 'IdC',
         provider = 'BuilderId',
-        profileArn
+        profileArn,
+        accountId
       } = credentials
-      let { accessToken } = credentials
+      let finalAccessToken = credentials.accessToken
+      let finalRefreshToken = refreshToken
+      let finalExpiresIn = 3600
 
-      // 切号前先刷新 token，确保写入的 accessToken 是最新的
-      // Kiro IDE 会直接使用 accessToken（不过期就不刷新），旧 token 会导致 Invalid token
+      // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
       if (refreshToken) {
         console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
         const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
         if (refreshResult.success && refreshResult.accessToken) {
-          accessToken = refreshResult.accessToken
-          console.log('[Switch Account] Token refreshed successfully')
+          finalAccessToken = refreshResult.accessToken
+          // bug A 修复：OIDC 返回新 refreshToken 时必须替换；否则下次 IDE/反代 refresh 会撞已作废的 v1
+          finalRefreshToken = refreshResult.refreshToken || refreshToken
+          finalExpiresIn = refreshResult.expiresIn ?? 3600
+          console.log('[Switch Account] Token refreshed successfully (rotated refreshToken updated)')
         } else {
-          console.warn(`[Switch Account] Token refresh failed: ${refreshResult.error}, using existing token`)
+          // bug D 修复：refresh 失败不写文件 + 直接报错，避免给 IDE 留下"半坏"token
+          const errMsg = refreshResult.error || 'Unknown refresh error'
+          console.warn(`[Switch Account] Token refresh failed, aborting switch: ${errMsg}`)
+          return {
+            success: false,
+            error: `刷新 Token 失败，未写入 Kiro IDE 磁盘文件，避免下次自动刷新失败导致 IDE 强制登出。原因：${errMsg}`
+          }
         }
       }
-      
-      // 计算 clientIdHash (与 Kiro 客户端一致)
-      // Enterprise 账户使用自己的 startUrl，BuilderId 使用默认的
-      const effectiveStartUrl = startUrl || 'https://view.awsapps.com/start'
-      const clientIdHash = crypto.createHash('sha1')
-        .update(JSON.stringify({ startUrl: effectiveStartUrl }))
-        .digest('hex')
-      
-      // 确保目录存在
-      const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
-      await mkdir(ssoCache, { recursive: true })
-      
-      // 根据 provider 推导 profileArn（官方固定规则）
-      const SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
-      const BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
-      const resolvedProfileArn = profileArn
-        || (authMethod === 'social' || provider === 'Google' || provider === 'Github' ? SOCIAL_PROFILE_ARN : BUILDER_ID_PROFILE_ARN)
 
-      // 写入 token 文件（格式与官方 Kiro IDE 完全一致）
-      const tokenPath = path.join(ssoCache, 'kiro-auth-token.json')
-      const tokenData: Record<string, unknown> = authMethod === 'social'
-        ? {
-            // Social 登录格式：accessToken, refreshToken, profileArn, expiresAt, authMethod, provider
-            accessToken,
-            refreshToken,
-            profileArn: resolvedProfileArn,
-            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
-            authMethod,
-            provider
-          }
-        : {
-            // IdC 登录格式：accessToken, refreshToken, expiresAt, clientIdHash, authMethod, provider, region
-            accessToken,
-            refreshToken,
-            expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
-            clientIdHash,
-            authMethod,
-            provider,
-            region,
-            profileArn: resolvedProfileArn
-          }
-      await writeFile(tokenPath, JSON.stringify(tokenData, null, 2))
-      console.log('[Switch Account] Token saved to:', tokenPath)
-      
-      // 只有 IdC 登录需要写入客户端注册文件
-      if (authMethod !== 'social' && clientId && clientSecret) {
-        const clientRegPath = path.join(ssoCache, `${clientIdHash}.json`)
-        const expiresAt = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString().replace('Z', '')
-        const clientData = {
-          clientId,
-          clientSecret,
-          expiresAt,
-          scopes: [
-            'codewhisperer:completions',
-            'codewhisperer:analysis',
-            'codewhisperer:conversations',
-            'codewhisperer:transformations',
-            'codewhisperer:taskassist'
-          ]
-        }
-        await writeFile(clientRegPath, JSON.stringify(clientData, null, 2))
-        console.log('[Switch Account] Client registration saved to:', clientRegPath)
+      // profileArn 决策统一由 helper：BuilderId 永远返回 undefined（不写占位符）
+      const resolvedProfileArn = resolveProfileArnForWrite({
+        profileArn,
+        authMethod,
+        provider
+      })
+
+      // bug C 修复：用真实 expiresIn 算 expiresAt
+      const expiresAtIso = new Date(Date.now() + finalExpiresIn * 1000).toISOString()
+
+      const { tokenPath, clientRegPath } = await writeKiroAuthTokenFile({
+        accessToken: finalAccessToken,
+        refreshToken: finalRefreshToken,
+        expiresAtIso,
+        authMethod,
+        provider,
+        region,
+        startUrl,
+        clientId,
+        clientSecret,
+        profileArn: resolvedProfileArn
+      })
+      console.log('[Switch Account] Token written to:', tokenPath)
+      if (clientRegPath) {
+        console.log('[Switch Account] Client registration written to:', clientRegPath)
       }
-      
-      return { success: true }
+
+      // 记录 lastSwitchedAccountId（供 watcher 反向同步时识别 IDE 当前账号）
+      if (accountId) {
+        lastSwitchedAccountId = accountId
+        // 同步记录 access/refresh 的"信任源头"，避免 watcher 把刚写的同一份数据再回写一次
+        lastWrittenTokenSignature = `${finalAccessToken}|${finalRefreshToken}`
+        // 如启用了主动续期，立刻 schedule 下一次（基于刚写入的 expiresAt）
+        if (proactiveRenewalEnabled) {
+          scheduleProactiveRenewal(accountId, Date.now() + finalExpiresIn * 1000)
+        }
+      }
+
+      return {
+        success: true,
+        // bug F 支持：回传 refresh 后的最新 credentials 让 renderer 更新 store
+        refreshedCredentials: {
+          accessToken: finalAccessToken,
+          refreshToken: finalRefreshToken,
+          expiresIn: finalExpiresIn
+        }
+      }
     } catch (error) {
       console.error('[Switch Account] Error:', error)
       return { success: false, error: error instanceof Error ? error.message : '切换失败' }
@@ -3693,10 +4645,13 @@ app.whenReady().then(async () => {
       const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
       const preferredRegKey = 'kirocli:odic:device-registration'
 
-      // 根据 provider 推导 profileArn
-      const SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
-      const BUILDER_ID_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
-      const resolvedProfileArn = profileArn || (isSocial ? SOCIAL_PROFILE_ARN : BUILDER_ID_PROFILE_ARN)
+      // profileArn 决策统一由 helper：BuilderId 不带 profileArn
+      // kiro-cli 同样不应该在 SQLite 里塞占位符 ARN（实测会触发 REST 端点 403）
+      const resolvedProfileArn = resolveProfileArnForWrite({
+        profileArn,
+        authMethod: isSocial ? 'social' : 'IdC',
+        provider
+      })
 
       // 构建 token JSON（snake_case 字段名，与 kiro-cli Rust 结构一致）
       const expiresAt = new Date(Date.now() + 3600 * 1000).toISOString()
@@ -3704,8 +4659,11 @@ app.whenReady().then(async () => {
         access_token: accessToken,
         refresh_token: refreshToken,
         expires_at: expiresAt,
-        region,
-        profile_arn: resolvedProfileArn
+        region
+      }
+      // profileArn 仅在解析出有效值时附加，BuilderId 等不带（避免 kiro-cli 拿占位符 ARN 调 REST 触发 403）
+      if (resolvedProfileArn) {
+        tokenData.profile_arn = resolvedProfileArn
       }
       if (scopes) tokenData.scopes = scopes
 
@@ -3774,7 +4732,12 @@ app.whenReady().then(async () => {
     const os = await import('os')
     const path = await import('path')
     const { readdir, unlink } = await import('fs/promises')
-    
+
+    // 立刻清掉主动续期 timer 和"激活账号"记忆，避免 watcher / timer 误同步
+    clearProactiveRenewal('logout-account')
+    lastSwitchedAccountId = null
+    lastWrittenTokenSignature = null
+
     try {
       const ssoCache = path.join(os.homedir(), '.aws', 'sso', 'cache')
       console.log('[Logout] Clearing SSO cache:', ssoCache)
@@ -4367,21 +5330,22 @@ app.whenReady().then(async () => {
 
   // IPC: 设置代理
   ipcMain.handle('set-proxy', async (_event, enabled: boolean, url: string) => {
-    console.log(`[IPC] set-proxy called: enabled=${enabled}, url=${url}`)
+    const normalizedUrl = enabled && url ? normalizeProxyUrl(url) : url
+    console.log(`[IPC] set-proxy called: enabled=${enabled}, url=${normalizedUrl}${normalizedUrl !== url ? ` (原始: ${url})` : ''}`)
     try {
       applyProxySettings(enabled, url)
       
       // 同时设置 Electron 的 session 代理
       if (mainWindow) {
         const session = mainWindow.webContents.session
-        if (enabled && url) {
-          await session.setProxy({ proxyRules: url })
+        if (enabled && normalizedUrl) {
+          await session.setProxy({ proxyRules: normalizedUrl })
         } else {
           await session.setProxy({ proxyRules: '' })
         }
       }
       
-      return { success: true }
+      return { success: true, normalizedUrl }
     } catch (error) {
       console.error('[Proxy] Failed to set proxy:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
@@ -4933,6 +5897,13 @@ app.whenReady().then(async () => {
       if (config.payloadSizeLimitKB !== undefined) {
         setPayloadSizeLimitKB(config.payloadSizeLimitKB)
       }
+      // 同步 Token buffer reserve（开关 + 数值）
+      if (config.enableTokenBufferReserve !== undefined) {
+        setEnableTokenBufferReserve(config.enableTokenBufferReserve)
+      }
+      if (config.tokenBufferReserve !== undefined) {
+        setTokenBufferReserve(config.tokenBufferReserve)
+      }
       // 保存配置到 store（用于自启动）
       if (store) {
         store.set('proxyConfig', newConfig)
@@ -4941,6 +5912,63 @@ app.whenReady().then(async () => {
     } catch (error) {
       console.error('[ProxyServer] Update config failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to update config' }
+    }
+  })
+
+  // ============ 反代安全 / 可观测 IPC（v1.8 新增） ============
+
+  // 获取自签证书信息（PEM、指纹、有效期、SAN）
+  ipcMain.handle('proxy-self-signed-cert-info', () => {
+    try {
+      if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
+      const info = proxyServer.getSelfSignedCertInfo()
+      if (!info) return { success: false, error: 'Failed to get self-signed cert info' }
+      return { success: true, ...info }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
+    }
+  })
+
+  // 重新生成自签证书（用户主动触发）
+  ipcMain.handle('proxy-self-signed-cert-regenerate', () => {
+    try {
+      if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
+      const info = proxyServer.regenerateSelfSignedCert()
+      if (!info) return { success: false, error: 'Failed to regenerate self-signed cert' }
+      return { success: true, ...info }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
+    }
+  })
+
+  // 检查反代配置是否需要重启
+  ipcMain.handle('proxy-needs-restart', () => {
+    try {
+      if (!proxyServer) return { needsRestart: false }
+      return { needsRestart: proxyServer.needsRestart() }
+    } catch {
+      return { needsRestart: false }
+    }
+  })
+
+  // 重启反代（用户在 UI 点"立即重启"时调用）
+  ipcMain.handle('proxy-restart', async () => {
+    try {
+      if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
+      await proxyServer.restartServer()
+      return { success: true }
+    } catch (err) {
+      return { success: false, error: (err as Error).message }
+    }
+  })
+
+  // 获取反代审计日志
+  ipcMain.handle('proxy-audit-log', () => {
+    try {
+      if (!proxyServer) return { entries: [] }
+      return { entries: proxyServer.getAuditLog().slice(-200) }
+    } catch {
+      return { entries: [] }
     }
   })
 
@@ -5333,6 +6361,37 @@ app.whenReady().then(async () => {
     } catch (error) {
       console.error('[ProxyServer] Reset pool failed:', error)
       return { success: false, error: error instanceof Error ? error.message : 'Failed to reset pool' }
+    }
+  })
+
+  // IPC: 手动解除账号封禁标记（用户确认账号已恢复后调用）
+  // 1) 清除反代池中的 suspended 状态
+  // 2) 同步清除 store.accountData[id].lastError，状态回到 active
+  ipcMain.handle('proxy-clear-account-suspended', (_event, accountId: string) => {
+    try {
+      if (proxyServer) {
+        proxyServer.getAccountPool().clearSuspended(accountId)
+      }
+      // 持久化清除 lastError
+      if (store) {
+        const accountData = store.get('accountData') as { accounts?: Record<string, Record<string, unknown>> } | undefined
+        if (accountData?.accounts?.[accountId]) {
+          const acc = accountData.accounts[accountId]
+          accountData.accounts[accountId] = {
+            ...acc,
+            status: 'active',
+            lastError: undefined,
+            lastCheckedAt: Date.now()
+          }
+          store.set('accountData', accountData)
+          lastSavedData = accountData
+        }
+      }
+      console.log(`[ProxyServer] Cleared suspended flag for account ${accountId}`)
+      return { success: true }
+    } catch (error) {
+      console.error('[ProxyServer] Clear suspended failed:', error)
+      return { success: false, error: error instanceof Error ? error.message : 'Failed to clear suspended' }
     }
   })
 
@@ -5983,7 +7042,23 @@ app.on('will-quit', async (event) => {
       // 刷新待写入的防抖数据
       flushStoreWrites()
       store.set('accountData', lastSavedData)
+      // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
+      await flushBackupNow()
+      // 强制落盘代理日志（异步节流中的尾巴数据）
+      try {
+        const { proxyLogStore } = await import('./proxy/logger')
+        await proxyLogStore.flushSaveNow()
+      } catch (err) {
+        console.error('[Exit] Failed to flush proxy logs:', err)
+      }
+      // 释放共享的 TLS ModuleClient（worker pool + DLL）
+      try {
+        const { shutdownTlsClientPool } = await import('./registration/tlsClientPool')
+        await shutdownTlsClientPool()
+      } catch (err) {
+        console.error('[Exit] Failed to shutdown TLS client pool:', err)
+      }
       console.log('[Exit] Data saved successfully')
     } catch (error) {
       console.error('[Exit] Failed to save data:', error)

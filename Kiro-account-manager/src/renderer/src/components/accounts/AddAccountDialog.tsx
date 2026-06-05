@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
-import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label } from '../ui'
+import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
+import { splitCredentialLine } from '@/lib/utils'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -60,7 +61,7 @@ type ImportMode = 'oidc' | 'sso' | 'login'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode } = useAccountsStore()
+  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
   const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
@@ -76,6 +77,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
   // 导入模式
   const [importMode, setImportMode] = useState<ImportMode>('login')
+
+  // 添加到的目标分组（默认=当前打开的分组，可在弹窗内改）；undefined=未分组（默认分组）
+  const [selectedGroupId, setSelectedGroupId] = useState<string | undefined>(undefined)
 
   // OIDC 凭证输入
   const [refreshToken, setRefreshToken] = useState('')
@@ -134,6 +138,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       }
     }
   }, [])
+
+  // 打开弹窗时默认选中"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
+  useEffect(() => {
+    if (!isOpen) return
+    const isRealGroup = activeGroupTab !== 'all' && activeGroupTab !== 'ungrouped' && groups.has(activeGroupTab)
+    setSelectedGroupId(isRealGroup ? activeGroupTab : undefined)
+  }, [isOpen, activeGroupTab, groups])
 
   // 监听 Social Auth 回调
   useEffect(() => {
@@ -213,6 +224,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           userId,
           nickname: email ? email.split('@')[0] : undefined,
           idp: providerName as 'BuilderId' | 'Google' | 'Github',
+          groupId: selectedGroupId,
           credentials: {
             accessToken: result.data.accessToken,
             csrfToken: '',
@@ -251,7 +263,6 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             nextResetDate: result.data.usage.nextResetDate,
             resourceDetail: result.data.usage.resourceDetail
           },
-          groupId: undefined,
           tags: [],
           status: 'active',
           lastUsedAt: now
@@ -546,6 +557,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             userId: userId || '',
             nickname: email ? email.split('@')[0] : undefined,
             idp: 'BuilderId',
+            groupId: selectedGroupId,
             credentials: {
               accessToken: result.data.accessToken,
               csrfToken: '',
@@ -579,7 +591,6 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               nextResetDate: result.data.usage?.nextResetDate,
               resourceDetail: result.data.usage?.resourceDetail
             },
-            groupId: undefined,
             tags: [],
             status: 'active',
             lastUsedAt: now
@@ -671,22 +682,22 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       }
 
       credentials = lines.map(line => {
-        let parts: string[]
-        if (line.includes('----')) {
-          parts = line.split('----')
-        } else if (line.includes('\t')) {
-          parts = line.split('\t')
-        } else {
-          parts = line.split(/\s{2,}/)
-        }
+        const parts = splitCredentialLine(line)
         const rawPwd = parts[1]?.trim()
+        const clientId = parts[3]?.trim() || undefined
+        const clientSecret = parts[4]?.trim() || undefined
+        // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断——
+        // social(Github/Google) 只有 refreshToken，IdC(BuilderId/Enterprise) 才有 ClientId/Secret。
+        // provider 决定下方 verify 的 authMethod(social→只需 refreshToken / IdC→需 ClientId+Secret)
+        const rawIdp = parts[5]?.trim()
+        const provider = rawIdp || ((!clientId && !clientSecret) ? 'Google' : 'BuilderId')
         return {
           _email: parts[0]?.trim() || '',
           password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
           refreshToken: parts[2]?.trim() || '',
-          clientId: parts[3]?.trim() || undefined,
-          clientSecret: parts[4]?.trim() || undefined,
-          provider: 'BuilderId'
+          clientId,
+          clientSecret,
+          provider
         }
       }).filter(item => item.refreshToken) as typeof credentials
 
@@ -759,6 +770,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             userId,
             nickname: email ? email.split('@')[0] : undefined,
             idp,
+            groupId: selectedGroupId,
             credentials: {
               accessToken: result.data.accessToken,
               csrfToken: '',
@@ -795,7 +807,6 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               nextResetDate: result.data.usage.nextResetDate,
               resourceDetail: result.data.usage.resourceDetail
             },
-            groupId: undefined,
             tags: [],
             status: 'active',
             lastUsedAt: now
@@ -842,7 +853,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           if (isKamiFormat) {
             // 卡密格式：还原为卡密文本
             const kamiLines = failedCredentials.map(c => 
-              [(c as Record<string, string>)._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || ''].join('----')
+              [(c as Record<string, string>)._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || '', c.provider || ''].join('----')
             )
             setOidcBatchData(kamiLines.join('\n'))
           } else {
@@ -904,6 +915,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           userId,
           nickname: email ? email.split('@')[0] : undefined,
           idp: providerName as 'BuilderId' | 'Github' | 'Google',
+          groupId: selectedGroupId,
           credentials: {
             accessToken: result.data.accessToken,
             csrfToken: '',
@@ -940,7 +952,6 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             nextResetDate: result.data.usage.nextResetDate,
             resourceDetail: result.data.usage.resourceDetail
           },
-          groupId: undefined,
           tags: [],
           status: 'active',
           lastUsedAt: now
@@ -990,7 +1001,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         <CardHeader className="pb-4 border-b">
           <div className="flex flex-row items-center justify-between">
             <CardTitle className="text-xl font-bold">{isEn ? 'Add Account' : '添加账号'}</CardTitle>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-muted" onClick={onClose}>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={onClose}>
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -998,6 +1009,21 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         </CardHeader>
 
         <CardContent className="space-y-6 pt-6">
+          {/* 添加到分组（默认=当前打开的分组，可改）；无分组时不显示 */}
+          {groups.size > 0 && (
+            <div className="flex items-center gap-3">
+              <Label className="text-sm whitespace-nowrap">{isEn ? 'Add to group' : '添加到分组'}</Label>
+              <Select
+                className="flex-1"
+                value={selectedGroupId ?? '__default__'}
+                onChange={(v) => setSelectedGroupId(v === '__default__' ? undefined : v)}
+                options={[
+                  { value: '__default__', label: isEn ? 'Default (Ungrouped)' : '默认（未分组）' },
+                  ...Array.from(groups.values()).sort((a, b) => a.order - b.order).map(g => ({ value: g.id, label: g.name }))
+                ]}
+              />
+            </div>
+          )}
           {/* 导入模式切换 */}
           <div className="grid grid-cols-3 gap-1 p-1 bg-muted/50 rounded-xl border">
             <button
@@ -1041,8 +1067,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               {/* 登录中状态 - Builder ID */}
               {isLoggingIn && builderIdLoginData && (
                 <div className="space-y-4">
-                  <div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg text-center">
-                    <p className="text-sm text-blue-700 dark:text-blue-300 mb-2">
+                  <div className="p-4 bg-primary/[0.08] rounded-lg text-center border border-primary/15">
+                    <p className="text-sm text-primary mb-2">
                       {isEn ? 'Complete login in browser and enter this code:' : '请在浏览器中完成登录，并输入以下代码：'}
                     </p>
                     <div className="flex items-center justify-center gap-2">
@@ -1055,7 +1081,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                         onClick={handleCopyUserCode}
                         title={isEn ? 'Copy code' : '复制代码'}
                       >
-                        {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+                        {copied ? <Check className="h-4 w-4 text-success" /> : <Copy className="h-4 w-4" />}
                       </Button>
                     </div>
                     <div className="mt-3 flex items-center justify-center gap-2 text-xs text-muted-foreground">
@@ -1087,9 +1113,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               {/* 登录中状态 - Social Auth */}
               {isLoggingIn && !builderIdLoginData && (
                 <div className="space-y-4">
-                  <div className="p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg text-center">
-                    <Loader2 className="h-8 w-8 animate-spin mx-auto mb-2 text-blue-500" />
-                    <p className="text-sm text-blue-700 dark:text-blue-300">
+                  <div className="p-4 bg-primary/[0.08] rounded-lg text-center border border-primary/15">
+                    <Loader2 className="h-8 w-8 animate-spin mx-auto mb-2 text-primary" />
+                    <p className="text-sm text-primary">
                       {isEn ? 'Complete login in browser...' : '请在浏览器中完成登录...'}
                     </p>
                     <p className="text-xs text-muted-foreground mt-1">
@@ -1329,7 +1355,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                               setTimeout(() => setCopied(false), 2000)
                             }}
                           >
-                            {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+                            {copied ? <Check className="w-4 h-4 text-success" /> : <Copy className="w-4 h-4" />}
                           </Button>
                         </div>
                       </div>
@@ -1354,17 +1380,17 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           {/* SSO Token 导入模式 */}
           {importMode === 'sso' && !verifiedData && (
             <div className="space-y-5">
-              <div className="p-4 bg-blue-50/50 dark:bg-blue-900/10 rounded-xl border border-blue-100 dark:border-blue-900/20">
+              <div className="p-4 bg-primary/[0.04] rounded-xl border border-primary/15">
                 <div className="flex items-start gap-3">
-                   <div className="p-2 bg-blue-100 dark:bg-blue-900/30 rounded-lg text-blue-600 dark:text-blue-400">
+                   <div className="p-2 bg-primary/10 rounded-lg text-primary">
                       <Info className="w-4 h-4" />
                    </div>
                    <div className="flex-1">
-                      <p className="text-sm font-semibold text-blue-700 dark:text-blue-300 mb-1.5">{isEn ? 'How to get Token?' : '如何获取 Token?'}</p>
-                      <ol className="text-xs text-blue-600/90 dark:text-blue-400/90 list-decimal list-inside space-y-1.5">
-                        <li>{isEn ? 'Visit and login:' : '在浏览器中访问并登录:'} <a href="https://view.awsapps.com/start/#/device?user_code=PQCF-FCCN/start/#/device?user_code=PQCF-FCCN" target="_blank" className="underline hover:text-blue-800 font-medium">view.awsapps.com/start/#/device?user_code=PQCF-FCCN</a></li>
+                      <p className="text-sm font-semibold text-primary mb-1.5">{isEn ? 'How to get Token?' : '如何获取 Token?'}</p>
+                      <ol className="text-xs text-primary/90 list-decimal list-inside space-y-1.5">
+                        <li>{isEn ? 'Visit and login:' : '在浏览器中访问并登录:'} <a href="https://view.awsapps.com/start/#/device?user_code=PQCF-FCCN/start/#/device?user_code=PQCF-FCCN" target="_blank" className="underline hover:text-primary/80 font-medium">view.awsapps.com/start/#/device?user_code=PQCF-FCCN</a></li>
                         <li>{isEn ? 'Press F12 → Application → Cookies' : '按 F12 打开开发者工具 → Application → Cookies'}</li>
-                        <li>{isEn ? 'Find and copy' : '找到并复制'} <code className="px-1 py-0.5 bg-blue-100 dark:bg-blue-900/40 rounded font-mono text-[10px]">x-amz-sso_authn</code> {isEn ? 'value' : '的值'}</li>
+                        <li>{isEn ? 'Find and copy' : '找到并复制'} <code className="px-1 py-0.5 bg-primary/15 rounded font-mono text-[10px]">x-amz-sso_authn</code> {isEn ? 'value' : '的值'}</li>
                       </ol>
                    </div>
                 </div>
@@ -1445,12 +1471,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
               {/* 批量导入结果 */}
               {batchImportResult && (
-                <div className={`p-3 rounded-lg text-sm ${batchImportResult.failed > 0 ? 'bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800' : 'bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800'}`}>
-                  <p className={`font-medium ${batchImportResult.failed > 0 ? 'text-amber-700 dark:text-amber-300' : 'text-green-700 dark:text-green-300'}`}>
+                <div className={`p-3 rounded-lg text-sm ${batchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
+                  <p className={`font-medium ${batchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}>
                     {isEn ? `Result: ${batchImportResult.success}/${batchImportResult.total} succeeded` : `导入结果: 成功 ${batchImportResult.success}/${batchImportResult.total}`}
                   </p>
                   {batchImportResult.errors.length > 0 && (
-                    <ul className="mt-2 text-xs text-amber-600 dark:text-amber-400 space-y-0.5 max-h-20 overflow-y-auto">
+                    <ul className="mt-2 text-xs text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
                       {batchImportResult.errors.map((err, i) => (
                         <li key={i}>{err}</li>
                       ))}
@@ -1688,10 +1714,10 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               {/* 批量导入模式 */}
               {oidcImportMode === 'batch' && (
                 <>
-                  <div className="p-3 bg-blue-50/50 dark:bg-blue-900/10 rounded-xl border border-blue-100 dark:border-blue-900/20">
-                    <p className="text-xs text-blue-600 dark:text-blue-400">
-                      {isEn ? 'Supports JSON array or Card Key format. JSON required:' : '支持 JSON 数组或卡密格式。JSON 必填:'} <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">refreshToken</code>.
-                      {isEn ? 'Card Key format:' : '卡密格式：'} <code className="px-1 bg-blue-100 dark:bg-blue-900/40 rounded">{isEn ? 'email----pwd----token----id----secret' : '邮箱----密码----Token----ID----Secret'}</code>
+                  <div className="p-3 bg-primary/[0.04] rounded-xl border border-primary/15">
+                    <p className="text-xs text-primary">
+                      {isEn ? 'Supports JSON array or Card Key format. JSON required:' : '支持 JSON 数组或卡密格式。JSON 必填:'} <code className="px-1 bg-primary/15 rounded">refreshToken</code>.
+                      {isEn ? 'Card Key format:' : '卡密格式：'} <code className="px-1 bg-primary/15 rounded">{isEn ? 'email----pwd----token----id----secret' : '邮箱----密码----Token----ID----Secret'}</code>
                     </p>
                   </div>
 
@@ -1776,12 +1802,12 @@ email----password----refreshToken----clientId----clientSecret`
 
                   {/* 批量导入结果 */}
                   {oidcBatchImportResult && (
-                    <div className={`p-3 rounded-lg text-sm ${oidcBatchImportResult.failed > 0 ? 'bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800' : 'bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800'}`}>
-                      <p className={`font-medium ${oidcBatchImportResult.failed > 0 ? 'text-amber-700 dark:text-amber-300' : 'text-green-700 dark:text-green-300'}`}>
+                    <div className={`p-3 rounded-lg text-sm ${oidcBatchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
+                      <p className={`font-medium ${oidcBatchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}>
                         {isEn ? `Result: ${oidcBatchImportResult.success}/${oidcBatchImportResult.total} succeeded` : `导入结果: 成功 ${oidcBatchImportResult.success}/${oidcBatchImportResult.total}`}
                       </p>
                       {oidcBatchImportResult.errors.length > 0 && (
-                        <ul className="mt-2 text-xs text-amber-600 dark:text-amber-400 space-y-0.5 max-h-20 overflow-y-auto">
+                        <ul className="mt-2 text-xs text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
                           {oidcBatchImportResult.errors.map((err, i) => (
                             <li key={i}>{err}</li>
                           ))}

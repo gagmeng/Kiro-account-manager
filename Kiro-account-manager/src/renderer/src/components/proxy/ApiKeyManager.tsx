@@ -274,7 +274,7 @@ export function ApiKeyManager() {
                         className="hover:text-foreground"
                         onClick={e => { e.stopPropagation(); copyToClipboard(apiKey.id, apiKey.key) }}
                       >
-                        {copiedId === apiKey.id ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
+                        {copiedId === apiKey.id ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
                       </button>
                     </div>
                   </div>

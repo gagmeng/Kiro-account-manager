@@ -99,7 +99,7 @@ export function UpdateDialog() {
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="absolute inset-0 bg-black/50" onClick={handleClose} />
       
-      <div className="relative bg-background rounded-xl shadow-2xl w-full max-w-md m-4 animate-in zoom-in-95 duration-200 border overflow-hidden">
+      <div className="relative glass-card-strong rounded-2xl shadow-2xl w-full max-w-md m-4 animate-in zoom-in-95 duration-200 overflow-hidden">
         {/* 头部 */}
         <div className="bg-gradient-to-r from-primary/10 to-primary/5 p-6 border-b">
           <div className="flex items-center justify-between">
@@ -117,7 +117,7 @@ export function UpdateDialog() {
             {status !== 'downloading' && (
               <button
                 onClick={handleClose}
-                className="p-2 hover:bg-muted rounded-lg transition-colors"
+                className="p-2 hover:bg-red-500 hover:text-white rounded-lg transition-colors"
               >
                 <X className="h-5 w-5" />
               </button>
@@ -174,7 +174,7 @@ export function UpdateDialog() {
 
           {status === 'downloaded' && (
             <>
-              <div className="flex items-center gap-3 text-green-600">
+              <div className="flex items-center gap-3 text-success">
                 <CheckCircle className="h-6 w-6" />
                 <span className="font-medium">下载完成！</span>
               </div>
@@ -209,3 +209,5 @@ export function UpdateDialog() {
     document.body
   )
 }
+
+

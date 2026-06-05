@@ -210,14 +210,14 @@ export function EditAccountDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => onOpenChange(false)} />
+      <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
 
       <Card className="relative w-full max-w-lg max-h-[90vh] overflow-auto z-10 animate-in zoom-in-95 duration-200">
         {/* 头部 */}
         <CardHeader className="pb-4 border-b sticky top-0 bg-background z-20">
           <div className="flex items-center justify-between">
             <CardTitle className="text-xl font-bold">{isEn ? 'Edit Account' : '编辑账号'}</CardTitle>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-muted" onClick={() => onOpenChange(false)}>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -230,7 +230,7 @@ export function EditAccountDialog({
             <div className="p-4 bg-primary/5 rounded-xl border border-primary/10 space-y-3">
               <div className="flex items-center justify-between border-b border-primary/10 pb-2">
                 <span className="text-sm font-semibold text-foreground/80">{isEn ? 'Account Status' : '当前账号状态'}</span>
-                <div className="px-2.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 text-xs font-medium flex items-center gap-1.5">
+                <div className="px-2.5 py-0.5 rounded-full bg-success/10 text-success text-xs font-medium flex items-center gap-1.5">
                   <CheckCircle className="h-3.5 w-3.5" />
                   {isEn ? 'Verified' : '已验证'}
                 </div>
@@ -316,7 +316,7 @@ export function EditAccountDialog({
                       className="h-7 px-2 text-xs"
                       onClick={handleCopyAccessToken}
                     >
-                      {copiedToken ? <Check className="h-3 w-3 mr-1 text-green-500" /> : <Copy className="h-3 w-3 mr-1" />}
+                      {copiedToken ? <Check className="h-3 w-3 mr-1 text-success" /> : <Copy className="h-3 w-3 mr-1" />}
                       {copiedToken ? (isEn ? 'Copied' : '已复制') : (isEn ? 'Copy' : '复制')}
                     </Button>
                   </div>
@@ -422,3 +422,5 @@ export function EditAccountDialog({
     </div>
   )
 }
+
+

@@ -198,9 +198,9 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => onOpenChange(false)} />
-      <Card className="relative w-[780px] max-h-[85vh] shadow-2xl border overflow-hidden animate-in fade-in zoom-in-95 duration-200 bg-gradient-to-br from-background to-muted/20">
-        <CardHeader className="pb-4 border-b sticky top-0 bg-background/95 backdrop-blur z-10">
+      <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
+      <Card className="relative w-[780px] max-h-[85vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
+        <CardHeader className="pb-4 border-b sticky top-0 z-10">
           <div className="flex items-center justify-between">
             <CardTitle className="text-xl flex items-center gap-3">
               <div className="p-2 rounded-xl bg-primary/10">
@@ -220,7 +220,7 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
                 </div>
               </div>
             </CardTitle>
-            <Button variant="ghost" size="icon" className="h-9 w-9 rounded-lg hover:bg-destructive/10 hover:text-destructive" onClick={() => onOpenChange(false)}>
+            <Button variant="ghost" size="icon" className="h-9 w-9 rounded-lg hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
               <X className="h-5 w-5" />
             </Button>
           </div>
@@ -301,13 +301,13 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
               })}
             </div>
 
-            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 flex items-start gap-2 text-sm text-amber-700 dark:text-amber-300">
+            <div className="rounded-xl border border-warning/30 bg-warning/10 p-3 flex items-start gap-2 text-sm text-warning">
               <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
               <div>{isEn ? 'Existing client files are merged and backed up before writing.' : '写入时会合并原配置并先创建备份。'}</div>
             </div>
 
             {error && (
-              <div className="rounded-xl border border-red-500/30 bg-red-500/10 p-3 flex items-start gap-2 text-sm text-red-600 dark:text-red-400">
+              <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3 flex items-start gap-2 text-sm text-destructive">
                 <AlertCircle className="h-4 w-4 mt-0.5 shrink-0" />
                 <div>{error}</div>
               </div>
@@ -316,15 +316,15 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
             {results.length > 0 && (
               <div className="space-y-2">
                 {results.map(result => (
-                  <div key={result.client} className={cn('rounded-xl border p-3 text-sm', result.success ? 'border-green-500/30 bg-green-500/10' : 'border-red-500/30 bg-red-500/10')}>
+                  <div key={result.client} className={cn('rounded-xl border p-3 text-sm', result.success ? 'border-success/30 bg-success/10' : 'border-destructive/30 bg-destructive/10')}>
                     <div className="flex items-center justify-between gap-2 mb-2">
                       <span className="font-semibold">{clientLabels[result.client]}</span>
-                      <Badge className={result.success ? 'bg-green-500/15 text-green-600 border-green-500/20' : 'bg-red-500/15 text-red-600 border-red-500/20'}>
+                      <Badge className={result.success ? 'bg-success/15 text-success border-success/20' : 'bg-destructive/15 text-destructive border-destructive/20'}>
                         {result.success ? (isEn ? 'Configured' : '已配置') : (isEn ? 'Failed' : '失败')}
                       </Badge>
                     </div>
                     {result.error ? (
-                      <div className="text-xs text-red-600 dark:text-red-400">{result.error}</div>
+                      <div className="text-xs text-destructive">{result.error}</div>
                     ) : (
                       <div className="space-y-1 text-xs text-muted-foreground">
                         {result.paths.map(path => <div key={path} className="font-mono break-all">{path}</div>)}
@@ -349,3 +349,5 @@ export function ClientConfigDialog({ open, onOpenChange, isEn }: ClientConfigDia
     </div>
   )
 }
+
+

@@ -64,9 +64,9 @@ export function ProxyLogsDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => onOpenChange(false)} />
-      <Card className="relative w-[900px] max-h-[80vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200">
-        <CardHeader className="pb-3 border-b sticky top-0 bg-background z-10">
+      <div className="absolute inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
+      <Card className="relative w-[900px] max-h-[80vh] shadow-2xl border-0 overflow-hidden animate-in fade-in zoom-in-95 duration-200 glass-card-strong">
+        <CardHeader className="pb-3 border-b sticky top-0 z-10">
           <div className="flex items-center justify-between">
             <CardTitle className="text-lg">{isEn ? 'Request Logs' : '请求日志'}</CardTitle>
             <div className="flex items-center gap-2">
@@ -78,15 +78,15 @@ export function ProxyLogsDialog({
                 <Trash2 className="h-4 w-4 mr-1" />
                 {isEn ? 'Clear' : '清空'}
               </Button>
-              <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => onOpenChange(false)}>
+              <Button variant="ghost" size="icon" className="h-8 w-8 rounded-lg hover:bg-red-500 hover:text-white transition-colors" onClick={() => onOpenChange(false)}>
                 <X className="h-4 w-4" />
               </Button>
             </div>
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-sm">
             <span>{isEn ? 'Total' : '总计'}: <Badge variant="secondary">{logs.length}</Badge></span>
-            <span>{isEn ? 'Success' : '成功'}: <Badge className="bg-green-500/20 text-green-600">{successCount}</Badge></span>
-            <span>{isEn ? 'Error' : '错误'}: <Badge className="bg-red-500/20 text-red-600">{errorCount}</Badge></span>
+            <span>{isEn ? 'Success' : '成功'}: <Badge className="bg-success/20 text-success">{successCount}</Badge></span>
+            <span>{isEn ? 'Error' : '错误'}: <Badge className="bg-destructive/20 text-destructive">{errorCount}</Badge></span>
             <span className="text-muted-foreground">|</span>
             <span>Tokens {isEn ? 'Recent' : '最近'}: <Badge variant="outline">{recentTokens.toLocaleString()}</Badge></span>
             <span className="flex items-center gap-1">
@@ -140,34 +140,34 @@ export function ProxyLogsDialog({
                         {log.status >= 400 && log.error ? (
                           <div className="relative inline-block">
                             <Badge 
-                              className="bg-red-500/20 text-red-600 cursor-pointer hover:bg-red-500/30 transition-colors"
+                              className="bg-destructive/20 text-destructive cursor-pointer hover:bg-destructive/30 transition-colors"
                               onClick={() => setExpandedError(expandedError === idx ? null : idx)}
                             >
                               <AlertCircle className="h-3 w-3 mr-1" />
                               {log.status}
                             </Badge>
                             {expandedError === idx && (
-                              <div className="absolute z-50 top-full left-1/2 -translate-x-1/2 mt-2 w-80 bg-background border border-red-500/30 rounded-lg shadow-xl p-3 text-left">
-                                <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-3 h-3 bg-background border-l border-t border-red-500/30 rotate-45"></div>
+                              <div className="absolute z-50 top-full left-1/2 -translate-x-1/2 mt-2 w-80 bg-background border border-destructive/30 rounded-lg shadow-xl p-3 text-left">
+                                <div className="absolute -top-2 left-1/2 -translate-x-1/2 w-3 h-3 bg-background border-l border-t border-destructive/30 rotate-45"></div>
                                 <div className="text-xs font-sans">
-                                  <div className="font-medium text-red-600 mb-2 flex items-center gap-1">
+                                  <div className="font-medium text-destructive mb-2 flex items-center gap-1">
                                     <AlertCircle className="h-3 w-3" />
                                     {isEn ? 'Error Details' : '错误详情'}
                                   </div>
-                                  <pre className="whitespace-pre-wrap break-all bg-red-500/10 p-2 rounded text-red-700 text-xs max-h-40 overflow-y-auto">{log.error}</pre>
+                                  <pre className="whitespace-pre-wrap break-all bg-destructive/10 p-2 rounded text-destructive text-xs max-h-40 overflow-y-auto">{log.error}</pre>
                                 </div>
                               </div>
                             )}
                           </div>
                         ) : (
-                          <Badge className={log.status >= 400 ? 'bg-red-500/20 text-red-600' : 'bg-green-500/20 text-green-600'}>
+                          <Badge className={log.status >= 400 ? 'bg-destructive/20 text-destructive' : 'bg-success/20 text-success'}>
                             {log.status}
                           </Badge>
                         )}
                       </td>
                       <td className="p-2 text-center text-muted-foreground">{log.inputTokens ? log.inputTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-center text-muted-foreground">{log.outputTokens ? log.outputTokens.toLocaleString() : '-'}</td>
-                      <td className="p-2 text-center text-emerald-500">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</td>
+                      <td className="p-2 text-center text-success">{log.cacheReadTokens ? log.cacheReadTokens.toLocaleString() : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.credits ? log.credits.toFixed(6) : '-'}</td>
                       <td className="p-2 text-right text-muted-foreground">{log.responseTime ? `${(log.responseTime / 1000).toFixed(1)}s` : '-'}</td>
                     </tr>
@@ -181,3 +181,5 @@ export function ProxyLogsDialog({
     </div>
   )
 }
+
+
